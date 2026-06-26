@@ -14,11 +14,6 @@ burn = {
   default-features = false,
   features = ["std"]
 }
-burn-ndarray = {
-  version = "0.21",
-  default-features = false,
-  features = ["std"]
-}
 burn-nn = { version = "0.21", default-features = false, features = ["std"] }
 burn-store = {
   version = "0.21",
@@ -80,7 +75,6 @@ getrandom = {
 [features]
 default = ["backend-vulkan", "dep:clap", "dep:pdfium", "dep:png"]
 backend-metal = ["burn-wgpu/metal", "dep:burn-wgpu"]
-backend-ndarray = []
 backend-vulkan = ["burn-wgpu/vulkan", "dep:burn-wgpu"]
 backend-webgpu = [
   "burn-wgpu/webgpu",

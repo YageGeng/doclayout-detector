@@ -21,18 +21,11 @@ pub struct PPDocLayoutV3Model<B: Backend> {
     enc_output_linear: Linear<B>,
     enc_output_norm: LayerNorm<B>,
     enc_score_head: Linear<B>,
-    enc_bbox_head: PPDocLayoutV3MlpPredictionHead<B>,
     decoder: PPDocLayoutV3Decoder<B>,
     decoder_norm: LayerNorm<B>,
     decoder_order_head: Vec<Linear<B>>,
     decoder_global_pointer: PPDocLayoutV3GlobalPointer<B>,
     mask_query_head: PPDocLayoutV3MlpPredictionHead<B>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PPDocLayoutV3ProposalOutput<B: Backend> {
-    pub logits: Tensor<B, 3>,
-    pub pred_boxes: Tensor<B, 3>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,15 +63,6 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
             enc_output_linear: load_linear(weights, "model.enc_output.0", 256, 256, true, device)?,
             enc_output_norm: load_layer_norm(weights, "model.enc_output.1", 256, device)?,
             enc_score_head: load_linear(weights, "model.enc_score_head", 256, 25, true, device)?,
-            enc_bbox_head: PPDocLayoutV3MlpPredictionHead::load(
-                weights,
-                "model.enc_bbox_head",
-                256,
-                256,
-                4,
-                3,
-                device,
-            )?,
             decoder: PPDocLayoutV3Decoder::load(weights, "model.decoder", device)?,
             decoder_norm: load_layer_norm(weights, "model.decoder_norm", 256, device)?,
             decoder_order_head: (0..6)
@@ -178,19 +162,6 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         }
     }
 
-    /// Returns encoder proposal logits and boxes without running the decoder stack.
-    pub fn forward_encoder_proposals(
-        &self,
-        pixel_values: Tensor<B, 4>,
-    ) -> PPDocLayoutV3ProposalOutput<B> {
-        let prepared = self.prepare_decoder_inputs(pixel_values);
-
-        PPDocLayoutV3ProposalOutput {
-            logits: prepared.encoder_logits,
-            pred_boxes: sigmoid(prepared.encoder_reference_points_unact),
-        }
-    }
-
     /// Prepares decoder inputs using backend-native proposal top-k selection.
     fn prepare_decoder_inputs(&self, pixel_values: Tensor<B, 4>) -> PPDocLayoutV3PreparedInputs<B> {
         let encoded = self.encode_decoder_inputs(pixel_values);
@@ -272,8 +243,7 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
             source_flatten.push(source.flatten(2, 3).swap_dims(1, 2));
         }
         let source_flatten = Tensor::cat(source_flatten, 1);
-        let (anchors, valid_mask) =
-            anchors_and_valid_mask(&spatial_shapes, source_flatten.device());
+        let (_, valid_mask) = anchors_and_valid_mask(&spatial_shapes, source_flatten.device());
         let memory = source_flatten.clone() * valid_mask.clone().repeat_dim(2, 256);
         #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
         profile.finish();
@@ -291,7 +261,6 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         let profile = WasmForwardTimer::start("encode_proposal_heads");
         let enc_outputs_class = self.enc_score_head.forward(output_memory.clone());
         debug_stats("enc_outputs_class", &enc_outputs_class);
-        let enc_outputs_coord_logits = self.enc_bbox_head.forward(output_memory.clone()) + anchors;
         let total_tokens = enc_outputs_class.dims()[1];
         let topk = total_tokens.min(300);
         let proposal_scores = enc_outputs_class.clone().max_dim(2)
@@ -301,8 +270,6 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
 
         PPDocLayoutV3EncodedInputs {
             output_memory,
-            enc_outputs_class,
-            enc_outputs_coord_logits,
             mask_feat,
             source_flatten,
             spatial_shapes,
@@ -317,28 +284,6 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         encoded: PPDocLayoutV3EncodedInputs<B>,
         topk_indices: Tensor<B, 3, Int>,
     ) -> PPDocLayoutV3PreparedInputs<B> {
-        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
-        let profile = WasmForwardTimer::start("prepare_gather_encoder_logits");
-        let encoder_logits = pad_queries(
-            encoded
-                .enc_outputs_class
-                .gather(1, topk_indices.clone().repeat_dim(2, 25)),
-            25,
-        );
-        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
-        profile.finish();
-
-        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
-        let profile = WasmForwardTimer::start("prepare_gather_reference_points");
-        let encoder_reference_points_unact = pad_queries(
-            encoded
-                .enc_outputs_coord_logits
-                .gather(1, topk_indices.clone().repeat_dim(2, 4)),
-            4,
-        );
-        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
-        profile.finish();
-
         #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
         let profile = WasmForwardTimer::start("prepare_gather_target");
         let target = pad_queries(
@@ -366,18 +311,14 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         PPDocLayoutV3PreparedInputs {
             target,
             reference_points_unact,
-            encoder_reference_points_unact,
             source_flatten: encoded.source_flatten,
             spatial_shapes: encoded.spatial_shapes,
-            encoder_logits,
         }
     }
 }
 
 struct PPDocLayoutV3EncodedInputs<B: Backend> {
     output_memory: Tensor<B, 3>,
-    enc_outputs_class: Tensor<B, 3>,
-    enc_outputs_coord_logits: Tensor<B, 3>,
     mask_feat: Tensor<B, 4>,
     source_flatten: Tensor<B, 3>,
     spatial_shapes: Vec<(usize, usize)>,
@@ -388,10 +329,8 @@ struct PPDocLayoutV3EncodedInputs<B: Backend> {
 struct PPDocLayoutV3PreparedInputs<B: Backend> {
     target: Tensor<B, 3>,
     reference_points_unact: Tensor<B, 3>,
-    encoder_reference_points_unact: Tensor<B, 3>,
     source_flatten: Tensor<B, 3>,
     spatial_shapes: Vec<(usize, usize)>,
-    encoder_logits: Tensor<B, 3>,
 }
 
 /// Repeats short proposal tensors so the decoder always receives 300 queries.
@@ -406,14 +345,13 @@ fn pad_queries<B: Backend>(tensor: Tensor<B, 3>, channels: usize) -> Tensor<B, 3
         .slice([0..1, 0..300, 0..channels])
 }
 
-/// Selects the top proposal indices on the active tensor backend.
+/// Selects proposal indices with the active backend's top-k kernel.
 fn proposal_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
-    let (_, indices) = scores.topk_with_indices(topk, 1);
-    indices
+    scores.argtopk(topk, 1)
 }
 
 #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
-/// Selects proposal indices through an explicit async readback in the wasm path.
+/// Selects proposal indices through explicit async readback to avoid slow browser WebGPU argtopk.
 async fn proposal_topk_indices_async<B: Backend>(
     scores: Tensor<B, 3>,
     topk: usize,
@@ -463,7 +401,7 @@ fn host_topk_indices_from_values<B: Backend>(
         ranked.sort_unstable_by(|left, right| {
             values[batch_offset + *right].total_cmp(&values[batch_offset + *left])
         });
-        indices.extend(ranked.into_iter().take(topk).map(|index| index as i64));
+        indices.extend(ranked.into_iter().take(topk).map(|index| index as i32));
     }
 
     Tensor::<B, 2, Int>::from_data(TensorData::new(indices, [batch_size, topk]), device)
@@ -1139,12 +1077,23 @@ fn debug_stats<B: Backend, const D: usize>(name: &str, tensor: &Tensor<B, D>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
 
-    type TestBackend = burn_ndarray::NdArray<f32>;
+    type TestBackend = burn_wgpu::Vulkan;
+    static INIT_WGPU: Once = Once::new();
+
+    /// Returns the shared Vulkan test device after one-time Burn WGPU initialization.
+    fn test_device() -> burn_wgpu::WgpuDevice {
+        let device = burn_wgpu::WgpuDevice::DefaultDevice;
+        INIT_WGPU.call_once(|| {
+            burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(&device, Default::default());
+        });
+        device
+    }
 
     #[test]
     fn mask_to_box_coordinate_returns_normalized_cxcywh_and_zero_for_empty_masks() {
-        let device = burn_ndarray::NdArrayDevice::Cpu;
+        let device = test_device();
         let mut values = vec![-1.0; 2 * 4 * 5];
         for y in 1..=2 {
             for x in 2..=3 {
@@ -1166,21 +1115,21 @@ mod tests {
 
     #[test]
     fn host_topk_indices_selects_highest_proposal_scores() {
-        let device = burn_ndarray::NdArrayDevice::Cpu;
+        let device = test_device();
         let scores = Tensor::<TestBackend, 3>::from_data(
             TensorData::new(vec![0.1, 0.7, -2.0, 1.3, 0.5], [1, 5, 1]),
             &device,
         );
 
         let indices = host_topk_indices(scores, 3);
-        let values = indices.into_data().to_vec::<i64>().unwrap();
+        let values = indices.into_data().to_vec::<i32>().unwrap();
 
         assert_eq!(values, vec![3, 1, 4]);
     }
 
     #[test]
     fn order_logits_mask_sets_lower_triangle_and_diagonal_to_negative_sentinel() {
-        let device = burn_ndarray::NdArrayDevice::Cpu;
+        let device = test_device();
         let logits =
             Tensor::<TestBackend, 3>::from_data(TensorData::new(vec![1.0; 9], [1, 3, 3]), &device);
 

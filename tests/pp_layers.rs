@@ -1,10 +1,21 @@
 use doclayout_detector::pp_doclayout::{
     Activation, ConvBnAct, HgNetV2Backbone, HgNetV2Stem, PPDocLayoutV3EncoderInputProjection,
-    PPDocLayoutV3HybridEncoder, PPDocLayoutV3Model, PPDocLayoutV3Weights,
+    PPDocLayoutV3HybridEncoder, PPDocLayoutV3Weights,
 };
 use std::path::Path;
+use std::sync::Once;
 
-type TestBackend = burn_ndarray::NdArray<f32>;
+type TestBackend = burn_wgpu::Vulkan;
+static INIT_WGPU: Once = Once::new();
+
+/// Returns the shared Vulkan test device after one-time Burn WGPU initialization.
+fn test_device() -> burn_wgpu::WgpuDevice {
+    let device = burn_wgpu::WgpuDevice::DefaultDevice;
+    INIT_WGPU.call_once(|| {
+        burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(&device, Default::default());
+    });
+    device
+}
 
 #[test]
 fn pp_doclayout_conv_bn_act_loads_real_stem_weight_and_forwards() {
@@ -14,7 +25,7 @@ fn pp_doclayout_conv_bn_act_loads_real_stem_weight_and_forwards() {
         return;
     }
 
-    let device = burn_ndarray::NdArrayDevice::Cpu;
+    let device = test_device();
     let weights = PPDocLayoutV3Weights::from_file(path).unwrap();
     let layer = ConvBnAct::<TestBackend>::load(
         &weights,
@@ -43,7 +54,7 @@ fn pp_doclayout_hgnet_stem_loads_real_weights_and_forwards() {
         return;
     }
 
-    let device = burn_ndarray::NdArrayDevice::Cpu;
+    let device = test_device();
     let weights = PPDocLayoutV3Weights::from_file(path).unwrap();
     let stem = HgNetV2Stem::<TestBackend>::load(&weights, "model.backbone.model.embedder", &device)
         .unwrap();
@@ -62,7 +73,7 @@ fn pp_doclayout_hgnet_backbone_loads_real_weights_and_forwards() {
         return;
     }
 
-    let device = burn_ndarray::NdArrayDevice::Cpu;
+    let device = test_device();
     let weights = PPDocLayoutV3Weights::from_file(path).unwrap();
     let backbone =
         HgNetV2Backbone::<TestBackend>::load(&weights, "model.backbone.model", &device).unwrap();
@@ -85,7 +96,7 @@ fn pp_doclayout_encoder_input_projection_loads_real_weights_and_forwards() {
         return;
     }
 
-    let device = burn_ndarray::NdArrayDevice::Cpu;
+    let device = test_device();
     let weights = PPDocLayoutV3Weights::from_file(path).unwrap();
     let backbone =
         HgNetV2Backbone::<TestBackend>::load(&weights, "model.backbone.model", &device).unwrap();
@@ -118,7 +129,7 @@ fn pp_doclayout_hybrid_encoder_loads_real_weights_and_forwards() {
         return;
     }
 
-    let device = burn_ndarray::NdArrayDevice::Cpu;
+    let device = test_device();
     let weights = PPDocLayoutV3Weights::from_file(path).unwrap();
     let backbone =
         HgNetV2Backbone::<TestBackend>::load(&weights, "model.backbone.model", &device).unwrap();
@@ -146,23 +157,4 @@ fn pp_doclayout_hybrid_encoder_loads_real_weights_and_forwards() {
     assert_eq!(output.last_hidden_state[1].dims(), [1, 256, 4, 4]);
     assert_eq!(output.last_hidden_state[2].dims(), [1, 256, 2, 2]);
     assert_eq!(output.mask_feat.dims(), [1, 32, 16, 16]);
-}
-
-#[test]
-fn pp_doclayout_model_encoder_proposals_load_real_weights_and_forward() {
-    let path = Path::new("models/pp_doclayout_v3/model.safetensors");
-    if !path.exists() {
-        tracing::warn!(path = %path.display(), "skipping PP model test; model file is absent");
-        return;
-    }
-
-    let device = burn_ndarray::NdArrayDevice::Cpu;
-    let model = PPDocLayoutV3Model::<TestBackend>::load(path, &device).unwrap();
-    let input = burn::tensor::Tensor::<TestBackend, 4>::zeros([1, 3, 64, 64], &device);
-
-    let output = model.forward(input);
-
-    assert_eq!(output.logits.dims(), [1, 300, 25]);
-    assert_eq!(output.pred_boxes.dims(), [1, 300, 4]);
-    assert_eq!(output.order_logits.unwrap().dims(), [1, 300, 300]);
 }

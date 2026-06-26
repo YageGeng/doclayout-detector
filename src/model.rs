@@ -8,33 +8,13 @@ use burn::tensor::{Tensor, TensorData};
 use tracing::Level;
 
 #[cfg(not(any(
-    feature = "backend-ndarray",
     feature = "backend-metal",
     feature = "backend-vulkan",
     feature = "backend-webgpu"
 )))]
 compile_error!(
-    "select one layout backend feature: backend-ndarray, backend-metal, backend-vulkan, or backend-webgpu"
+    "select one layout backend feature: backend-metal, backend-vulkan, or backend-webgpu"
 );
-
-#[cfg(all(
-    feature = "backend-ndarray",
-    not(any(
-        feature = "backend-metal",
-        feature = "backend-vulkan",
-        feature = "backend-webgpu"
-    ))
-))]
-pub type LayoutBackend = burn_ndarray::NdArray<f32>;
-#[cfg(all(
-    feature = "backend-ndarray",
-    not(any(
-        feature = "backend-metal",
-        feature = "backend-vulkan",
-        feature = "backend-webgpu"
-    ))
-))]
-pub type LayoutDevice = burn_ndarray::NdArrayDevice;
 
 #[cfg(all(
     feature = "backend-metal",
@@ -57,15 +37,6 @@ pub type LayoutBackend = burn_wgpu::WebGpu;
 #[cfg(feature = "backend-webgpu")]
 pub type LayoutDevice = burn_wgpu::WgpuDevice;
 
-#[cfg(all(
-    feature = "backend-ndarray",
-    not(any(
-        feature = "backend-metal",
-        feature = "backend-vulkan",
-        feature = "backend-webgpu"
-    ))
-))]
-const BACKEND_NAME: &str = "ndarray";
 #[cfg(all(
     feature = "backend-metal",
     not(any(feature = "backend-vulkan", feature = "backend-webgpu"))
@@ -331,19 +302,6 @@ fn load_model(device: &LayoutDevice) -> Result<PPDocLayoutV3Model<LayoutBackend>
 }
 
 #[cfg(all(
-    feature = "backend-ndarray",
-    not(any(
-        feature = "backend-metal",
-        feature = "backend-vulkan",
-        feature = "backend-webgpu"
-    ))
-))]
-/// Creates a CPU ndarray device for deterministic native execution.
-fn create_device() -> LayoutDevice {
-    burn_ndarray::NdArrayDevice::Cpu
-}
-
-#[cfg(all(
     feature = "backend-metal",
     not(any(feature = "backend-vulkan", feature = "backend-webgpu"))
 ))]
@@ -384,9 +342,6 @@ mod tests {
 
     #[test]
     fn reports_compiled_backend_name() {
-        assert!(matches!(
-            BACKEND_NAME,
-            "ndarray" | "metal" | "vulkan" | "webgpu"
-        ));
+        assert!(matches!(BACKEND_NAME, "metal" | "vulkan" | "webgpu"));
     }
 }

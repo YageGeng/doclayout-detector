@@ -18,6 +18,7 @@ fn panic_hook_is_enabled_by_webgpu_not_by_default() {
         &["backend-vulkan", "dep:clap", "dep:pdfium", "dep:png"],
     );
     assert!(!features.contains_key("native-cli"));
+    assert!(!features.contains_key("backend-ndarray"));
     assert_feature_contains(&features, "backend-webgpu", "panic_hook");
 }
 
