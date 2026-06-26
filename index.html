@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PP-DocLayoutV3 PDF Preview</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        background: #f5f5f2;
+        color: #1d1d1b;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 16px;
+        align-items: center;
+        padding: 14px 18px;
+        border-bottom: 1px solid #d9d8d1;
+        background: rgba(245, 245, 242, 0.94);
+        backdrop-filter: blur(10px);
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 650;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        justify-content: flex-end;
+      }
+
+      input[type="file"],
+      input[type="number"] {
+        font: inherit;
+      }
+
+      input[type="number"] {
+        width: 76px;
+      }
+
+      button {
+        min-height: 34px;
+        padding: 0 12px;
+        border: 1px solid #1d1d1b;
+        border-radius: 6px;
+        background: #1d1d1b;
+        color: #ffffff;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+      }
+
+      main {
+        max-width: 1120px;
+        margin: 0 auto;
+        padding: 18px;
+      }
+
+      #status {
+        min-height: 24px;
+        color: #55554f;
+        font-size: 14px;
+      }
+
+      #pages {
+        display: grid;
+        gap: 18px;
+        margin-top: 12px;
+      }
+
+      .page {
+        border: 1px solid #d9d8d1;
+        border-radius: 8px;
+        background: #ffffff;
+        overflow: hidden;
+      }
+
+      .page-title {
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        padding: 10px 12px;
+        border-bottom: 1px solid #e7e5dd;
+        color: #44443f;
+        font-size: 13px;
+      }
+
+      .page img {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .legend {
+        position: fixed;
+        left: 14px;
+        top: 50%;
+        z-index: 3;
+        display: grid;
+        gap: 7px;
+        width: 148px;
+        max-height: calc(100vh - 96px);
+        padding: 10px;
+        overflow: auto;
+        border: 1px solid #d9d8d1;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.94);
+        box-shadow: 0 10px 32px rgba(29, 29, 27, 0.12);
+        transform: translateY(-50%);
+        backdrop-filter: blur(8px);
+      }
+
+      .legend-title {
+        margin: 0 0 2px;
+        color: #44443f;
+        font-size: 12px;
+        font-weight: 650;
+      }
+
+      .legend-item {
+        display: grid;
+        grid-template-columns: 12px 1fr;
+        gap: 8px;
+        align-items: center;
+        min-height: 18px;
+        color: #33332f;
+        font-size: 12px;
+        line-height: 1.2;
+      }
+
+      .legend-swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16);
+      }
+
+      @media (max-width: 720px) {
+        header {
+          grid-template-columns: 1fr;
+        }
+
+        .controls {
+          justify-content: flex-start;
+        }
+
+        .legend {
+          left: 8px;
+          width: 118px;
+          padding: 8px;
+        }
+
+        .legend-item {
+          gap: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>PP-DocLayoutV3 PDF Preview</h1>
+      <div class="controls">
+        <input id="file" type="file" accept="application/pdf,.pdf" />
+        <label>DPI <input id="dpi" type="number" min="72" max="220" step="6" value="144" /></label>
+        <button id="run" disabled>Detect</button>
+      </div>
+    </header>
+
+    <aside class="legend" aria-label="Layout label legend">
+      <p class="legend-title">Labels</p>
+      <div class="legend-item"><span class="legend-swatch" style="background: #7c4dff"></span><span>abstract</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #5c6bc0"></span><span>algorithm</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #26a69a"></span><span>aside_text</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #ef6c00"></span><span>chart</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #43a047"></span><span>content</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #ab47bc"></span><span>display_formula</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #d81b60"></span><span>doc_title</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #00897b"></span><span>figure_title</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #8d6e63"></span><span>footer</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #a1887f"></span><span>footer_image</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #f44336"></span><span>footnote</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #8e24aa"></span><span>formula_number</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #ff8f00"></span><span>header</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #f9a825"></span><span>header_image</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #9e9e9e"></span><span>image</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #7b1fa2"></span><span>inline_formula</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #3949ab"></span><span>number</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #1e88e5"></span><span>paragraph_title</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #00acc1"></span><span>reference</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #009688"></span><span>reference_content</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #c62828"></span><span>seal</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #009688"></span><span>table</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #43a047"></span><span>text</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #6d4c41"></span><span>vertical_text</span></div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #ec407a"></span><span>vision_footnote</span></div>
+    </aside>
+
+    <main>
+      <div id="status">Build the wasm package, then choose a PDF.</div>
+      <div id="pages"></div>
+    </main>
+
+    <script type="module">
+      import init, { PPDocLayoutWasm } from "./pkg/doclayout_detector.js";
+
+      const fileInput = document.querySelector("#file");
+      const dpiInput = document.querySelector("#dpi");
+      const runButton = document.querySelector("#run");
+      const status = document.querySelector("#status");
+      const pages = document.querySelector("#pages");
+
+      let detector = null;
+      let pdfBytes = null;
+
+      function setStatus(message) {
+        status.textContent = message;
+      }
+
+      async function boot() {
+        if (!("gpu" in navigator)) {
+          setStatus("WebGPU is not available in this browser.");
+          return;
+        }
+
+        setStatus("Loading wasm module...");
+        await init();
+        detector = new PPDocLayoutWasm();
+        runButton.disabled = !pdfBytes;
+        setStatus("Choose a PDF to detect layout boxes.");
+      }
+
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files?.[0];
+        pages.replaceChildren();
+        if (!file) {
+          pdfBytes = null;
+          runButton.disabled = true;
+          setStatus("Choose a PDF to detect layout boxes.");
+          return;
+        }
+
+        pdfBytes = new Uint8Array(await file.arrayBuffer());
+        runButton.disabled = !detector;
+        setStatus(`${file.name} loaded.`);
+      });
+
+      runButton.addEventListener("click", async () => {
+        if (!detector || !pdfBytes) return;
+
+        runButton.disabled = true;
+        pages.replaceChildren();
+
+        try {
+          const dpi = Number(dpiInput.value || 144);
+          const count = detector.pageCount(pdfBytes);
+          for (let pageNumber = 1; pageNumber <= count; pageNumber += 1) {
+            setStatus(`Detecting page ${pageNumber} of ${count}...`);
+            const page = await detector.detectPage(pdfBytes, pageNumber, dpi);
+            appendPage(page);
+          }
+          setStatus(`Finished ${count} page${count === 1 ? "" : "s"}.`);
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : String(error));
+        } finally {
+          runButton.disabled = false;
+        }
+      });
+
+      function appendPage(page) {
+        const section = document.createElement("section");
+        section.className = "page";
+
+        const title = document.createElement("div");
+        title.className = "page-title";
+        title.textContent = `Page ${page.pageNumber} · ${page.width} x ${page.height}px · ${page.detections.length} boxes`;
+
+        const img = document.createElement("img");
+        const blob = new Blob([page.imageBytes], { type: "image/png" });
+        img.src = URL.createObjectURL(blob);
+        img.alt = `Page ${page.pageNumber} with layout boxes`;
+
+        section.append(title, img);
+        pages.append(section);
+      }
+
+      boot().catch((error) => {
+        setStatus(error instanceof Error ? error.message : String(error));
+      });
+    </script>
+  </body>
+</html>
