@@ -351,61 +351,50 @@ fn proposal_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tenso
 }
 
 #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
-/// Selects proposal indices through explicit async readback to avoid slow browser WebGPU argtopk.
+/// Selects proposal indices with GPU-resident iterative argmax in the wasm path.
 async fn proposal_topk_indices_async<B: Backend>(
     scores: Tensor<B, 3>,
     topk: usize,
 ) -> Result<Tensor<B, 3, Int>, String> {
-    let profile = WasmForwardTimer::start("proposal_topk_readback");
-    let device = scores.device();
-    let dims = scores.dims();
-    let values = scores
-        .into_data_async()
-        .await
-        .map_err(|error| format!("read proposal scores tensor: {error}"))?
-        .to_vec::<f32>()
-        .map_err(|error| format!("decode proposal scores tensor: {error}"))?;
+    let profile = WasmForwardTimer::start("proposal_topk_iterative");
+    let indices = gpu_topk_indices(scores, topk);
     profile.finish();
-    Ok(host_topk_indices_from_values(values, dims, topk, &device))
-}
-
-#[cfg(test)]
-/// Builds proposal top-k indices on the host for deterministic test expectations.
-fn host_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
-    let device = scores.device();
-    let dims = scores.dims();
-    let values = scores
-        .into_data()
-        .to_vec::<f32>()
-        .expect("failed to read proposal scores for host top-k");
-    host_topk_indices_from_values(values, dims, topk, &device)
+    Ok(indices)
 }
 
 #[cfg(any(test, all(target_family = "wasm", feature = "backend-webgpu")))]
-/// Converts host proposal scores into a backend tensor of selected indices.
-fn host_topk_indices_from_values<B: Backend>(
-    values: Vec<f32>,
-    dims: [usize; 3],
-    topk: usize,
-    device: &B::Device,
-) -> Tensor<B, 3, Int> {
-    let [batch_size, token_count, channels] = dims;
+/// Selects proposal indices without host readback by repeatedly masking GPU argmax winners.
+fn gpu_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
+    let [batch_size, token_count, channels] = scores.dims();
     assert_eq!(
         channels, 1,
         "proposal scores are expected to have a singleton channel dimension"
     );
-    let mut indices = Vec::with_capacity(batch_size * topk);
-    for batch_index in 0..batch_size {
-        let batch_offset = batch_index * token_count;
-        let mut ranked = (0..token_count).collect::<Vec<_>>();
-        ranked.sort_unstable_by(|left, right| {
-            values[batch_offset + *right].total_cmp(&values[batch_offset + *left])
-        });
-        indices.extend(ranked.into_iter().take(topk).map(|index| index as i32));
+    assert!(
+        topk <= token_count,
+        "topk must not exceed the number of proposal scores"
+    );
+
+    let device = scores.device();
+    let penalty = Tensor::<B, 3>::full([batch_size, 1, 1], -1.0e9, &device);
+    let mut masked_scores = scores;
+    let mut selected = Vec::with_capacity(topk);
+
+    for _ in 0..topk {
+        let next_indices = masked_scores.clone().argmax(1);
+        // Burn WGPU scatter uses additive numeric updates, so adding a large
+        // negative penalty is the lightest backend-resident way to mask the
+        // selected proposal before the next argmax pass.
+        masked_scores = masked_scores.scatter(
+            1,
+            next_indices.clone(),
+            penalty.clone(),
+            burn::tensor::IndexingUpdateOp::Add,
+        );
+        selected.push(next_indices);
     }
 
-    Tensor::<B, 2, Int>::from_data(TensorData::new(indices, [batch_size, topk]), device)
-        .reshape([batch_size, topk, 1])
+    Tensor::cat(selected, 1)
 }
 
 #[derive(Debug, Clone)]
@@ -1091,6 +1080,43 @@ mod tests {
         device
     }
 
+    /// Builds proposal top-k indices on the host for deterministic test expectations.
+    fn host_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
+        let device = scores.device();
+        let dims = scores.dims();
+        let values = scores
+            .into_data()
+            .to_vec::<f32>()
+            .expect("failed to read proposal scores for host top-k");
+        host_topk_indices_from_values(values, dims, topk, &device)
+    }
+
+    /// Converts host proposal scores into a backend tensor of selected indices.
+    fn host_topk_indices_from_values<B: Backend>(
+        values: Vec<f32>,
+        dims: [usize; 3],
+        topk: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 3, Int> {
+        let [batch_size, token_count, channels] = dims;
+        assert_eq!(
+            channels, 1,
+            "proposal scores are expected to have a singleton channel dimension"
+        );
+        let mut indices = Vec::with_capacity(batch_size * topk);
+        for batch_index in 0..batch_size {
+            let batch_offset = batch_index * token_count;
+            let mut ranked = (0..token_count).collect::<Vec<_>>();
+            ranked.sort_unstable_by(|left, right| {
+                values[batch_offset + *right].total_cmp(&values[batch_offset + *left])
+            });
+            indices.extend(ranked.into_iter().take(topk).map(|index| index as i32));
+        }
+
+        Tensor::<B, 2, Int>::from_data(TensorData::new(indices, [batch_size, topk]), device)
+            .reshape([batch_size, topk, 1])
+    }
+
     #[test]
     fn mask_to_box_coordinate_returns_normalized_cxcywh_and_zero_for_empty_masks() {
         let device = test_device();
@@ -1122,6 +1148,20 @@ mod tests {
         );
 
         let indices = host_topk_indices(scores, 3);
+        let values = indices.into_data().to_vec::<i32>().unwrap();
+
+        assert_eq!(values, vec![3, 1, 4]);
+    }
+
+    #[test]
+    fn gpu_topk_indices_selects_highest_proposal_scores() {
+        let device = test_device();
+        let scores = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.1, 0.7, -2.0, 1.3, 0.5], [1, 5, 1]),
+            &device,
+        );
+
+        let indices = gpu_topk_indices(scores, 3);
         let values = indices.into_data().to_vec::<i32>().unwrap();
 
         assert_eq!(values, vec![3, 1, 4]);

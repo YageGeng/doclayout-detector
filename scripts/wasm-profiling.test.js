@@ -11,7 +11,7 @@ test("wasm model inference exposes detailed profiling events", async () => {
     "encode_backbone",
     "encode_encoder",
     "forward_async_topk",
-    "proposal_topk_readback",
+    "proposal_topk_iterative",
     "prepare_decoder_from_topk",
     "forward_decoder",
     "forward_order_head",
@@ -29,16 +29,17 @@ test("wasm model inference exposes detailed profiling events", async () => {
   }
 });
 
-test("wasm proposal top-k avoids slow WebGPU argtopk and unsupported sorting", async () => {
+test("wasm proposal top-k stays on WebGPU without slow argtopk or sorting", async () => {
   const model = await readFile("src/pp_doclayout/model.rs", "utf8");
-  // Burn WebGPU sorting panics and argtopk is currently too slow for wasm, so this path must read scores asynchronously.
+  // Burn WebGPU sorting panics and argtopk is too slow, so this path must stay on GPU with iterative argmax.
   const asyncTopk = model.match(
     /async fn proposal_topk_indices_async[\s\S]*?\n}\n\n#\[cfg\(test\)\]/,
   )?.[0];
 
   assert.ok(asyncTopk, "proposal_topk_indices_async should exist");
-  assert.match(asyncTopk, /into_data_async/);
-  assert.match(asyncTopk, /host_topk_indices_from_values/);
+  assert.match(asyncTopk, /gpu_topk_indices/);
+  assert.doesNotMatch(asyncTopk, /into_data_async/);
+  assert.doesNotMatch(asyncTopk, /host_topk_indices_from_values/);
   assert.doesNotMatch(asyncTopk, /argtopk/);
   assert.doesNotMatch(asyncTopk, /topk_with_indices/);
 });
