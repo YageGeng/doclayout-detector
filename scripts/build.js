@@ -31,6 +31,8 @@ const wasmTargetRustflags = [
 const build = spawnSync("wasm-pack", wasmPackArgs, {
   env: {
     ...process.env,
+    // Force Rust's release profile to use O3 for the wasm target build.
+    CARGO_PROFILE_RELEASE_OPT_LEVEL: "3",
     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: wasmTargetRustflags,
   },
   stdio: "inherit",
