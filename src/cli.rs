@@ -31,6 +31,8 @@ struct DetectArgs {
     output_dir: PathBuf,
     #[arg(long, default_value_t = DEFAULT_DPI)]
     dpi: f32,
+    #[arg(long = "batch-size", default_value_t = 1, value_parser = BatchSize::parse)]
+    batch_size: usize,
 }
 
 impl NativeCli {
@@ -57,7 +59,22 @@ impl NativeCommand {
 impl DetectArgs {
     /// Runs PDF detection using the parsed detect command options.
     fn run(self) -> Result<(), String> {
-        detect_pdf_to_dir(&self.input_pdf, &self.output_dir, self.dpi)
+        detect_pdf_to_dir(&self.input_pdf, &self.output_dir, self.dpi, self.batch_size)
+    }
+}
+
+struct BatchSize;
+
+impl BatchSize {
+    /// Parses a batch size constrained to the memory-safe supported range.
+    fn parse(value: &str) -> Result<usize, String> {
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|error| format!("batch size must be an integer: {error}"))?;
+        if !(1..=4).contains(&parsed) {
+            return Err("batch size must be between 1 and 4".to_string());
+        }
+        Ok(parsed)
     }
 }
 
@@ -71,7 +88,16 @@ pub fn run() {
 }
 
 /// Detects every page in a PDF, writes annotated outputs, and emits per-stage timing events.
-fn detect_pdf_to_dir(input_pdf: &Path, output_dir: &Path, dpi: f32) -> Result<(), String> {
+fn detect_pdf_to_dir(
+    input_pdf: &Path,
+    output_dir: &Path,
+    dpi: f32,
+    batch_size: usize,
+) -> Result<(), String> {
+    if batch_size == 0 {
+        return Err("batch size must be greater than zero".to_string());
+    }
+
     let total_started = Instant::now();
 
     let create_output_started = Instant::now();
@@ -112,7 +138,8 @@ fn detect_pdf_to_dir(input_pdf: &Path, output_dir: &Path, dpi: f32) -> Result<()
     let document = lib
         .load_document_from_bytes(&pdf_bytes, None)
         .map_err(|error| format!("load PDF {}: {error}", input_pdf.display()))?;
-    let page_count = document.page_count();
+    let page_count = usize::try_from(document.page_count())
+        .map_err(|error| format!("convert PDF page count: {error}"))?;
     tracing::event!(
         Level::INFO,
         step = "load_pdf",
@@ -121,119 +148,155 @@ fn detect_pdf_to_dir(input_pdf: &Path, output_dir: &Path, dpi: f32) -> Result<()
         "native pipeline step completed"
     );
 
-    for page_index in 0..page_count {
-        let page_started = Instant::now();
-        let page_number = page_index as u32 + 1;
+    let mut batch_start = 0usize;
+    while batch_start < page_count {
+        let batch_end = (batch_start + batch_size).min(page_count);
+        let batch_started = Instant::now();
+        let mut rendered_pages = Vec::with_capacity(batch_end - batch_start);
 
-        let load_page_started = Instant::now();
-        let page = document
-            .page(page_index)
-            .map_err(|error| format!("load page {page_number}: {error}"))?;
-        let page_width = page.width();
-        let page_height = page.height();
-        let load_page_ms = load_page_started.elapsed().as_secs_f64() * 1000.0;
+        for page_index in batch_start..batch_end {
+            let page_started = Instant::now();
+            let page_number = page_index as u32 + 1;
+            let pdf_page_index = i32::try_from(page_index)
+                .map_err(|error| format!("convert page index: {error}"))?;
 
-        let render_started = Instant::now();
-        let bitmap = page
-            .render(dpi)
-            .map_err(|error| format!("render page {page_number}: {error}"))?;
-        let width = bitmap.width() as u32;
-        let height = bitmap.height() as u32;
-        let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+            let load_page_started = Instant::now();
+            let page = document
+                .page(pdf_page_index)
+                .map_err(|error| format!("load page {page_number}: {error}"))?;
+            let page_width = page.width();
+            let page_height = page.height();
+            let load_page_ms = load_page_started.elapsed().as_secs_f64() * 1000.0;
 
-        let bitmap_started = Instant::now();
-        let rgb = bitmap.to_rgb();
-        let mut rgba = bitmap.to_rgba();
-        let bitmap_ms = bitmap_started.elapsed().as_secs_f64() * 1000.0;
+            let render_started = Instant::now();
+            let bitmap = page
+                .render(dpi)
+                .map_err(|error| format!("render page {page_number}: {error}"))?;
+            let width = bitmap.width() as u32;
+            let height = bitmap.height() as u32;
+            let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
 
-        let image = PageImage {
-            rgb: &rgb,
-            width,
-            height,
-            page_width,
-            page_height,
-            dpi,
-        };
-        let detect_started = Instant::now();
-        let detections = detector
-            .detect_page(&image)
-            .map_err(|error| format!("detect page {page_number}: {error}"))?;
-        let detect_ms = detect_started.elapsed().as_secs_f64() * 1000.0;
+            let bitmap_started = Instant::now();
+            let rgb = bitmap.to_rgb();
+            let rgba = bitmap.to_rgba();
+            let bitmap_ms = bitmap_started.elapsed().as_secs_f64() * 1000.0;
 
-        let annotate_started = Instant::now();
-        let annotated = detections
+            rendered_pages.push(RenderedPage {
+                page_started,
+                page_number,
+                width,
+                height,
+                page_width,
+                page_height,
+                rgb,
+                rgba,
+                load_page_ms,
+                render_ms,
+                bitmap_ms,
+            });
+        }
+
+        let images = rendered_pages
             .iter()
-            .map(AnnotatedDetection::from)
+            .map(|page| page.image(dpi))
             .collect::<Vec<_>>();
-
-        annotate_page_rgba(
-            &mut rgba,
-            width,
-            height,
-            page_width,
-            page_height,
-            &annotated,
-        );
-        let annotate_ms = annotate_started.elapsed().as_secs_f64() * 1000.0;
-
-        let encode_png_started = Instant::now();
-        let png_bytes = encode_png_rgba(&rgba, width, height)
-            .map_err(|error| format!("encode page {page_number} PNG: {error}"))?;
-        let encode_png_ms = encode_png_started.elapsed().as_secs_f64() * 1000.0;
-
-        let image_path = output_path_for_page(output_dir, page_number, "png");
-        let json_path = output_path_for_page(output_dir, page_number, "json");
-
-        let write_png_started = Instant::now();
-        fs::write(&image_path, png_bytes)
-            .map_err(|error| format!("write {}: {error}", image_path.display()))?;
-        let write_png_ms = write_png_started.elapsed().as_secs_f64() * 1000.0;
-
-        let serialize_json_started = Instant::now();
-        let json = NativePageOutput {
-            page_number,
-            width,
-            height,
-            page_width,
-            page_height,
-            dpi,
-            detections: &annotated,
-        };
-        let json = serde_json::to_vec_pretty(&json)
-            .map_err(|error| format!("serialize page {page_number} JSON: {error}"))?;
-        let serialize_json_ms = serialize_json_started.elapsed().as_secs_f64() * 1000.0;
-
-        let write_json_started = Instant::now();
-        fs::write(&json_path, json)
-            .map_err(|error| format!("write {}: {error}", json_path.display()))?;
-        let write_json_ms = write_json_started.elapsed().as_secs_f64() * 1000.0;
-
-        let total_page_ms = page_started.elapsed().as_secs_f64() * 1000.0;
+        let detect_started = Instant::now();
+        let detections_by_page = detector
+            .detect_pages(&images)
+            .map_err(|error| format!("detect pages {}-{}: {error}", batch_start + 1, batch_end))?;
+        let batch_detect_ms = detect_started.elapsed().as_secs_f64() * 1000.0;
+        drop(images);
 
         tracing::event!(
             Level::INFO,
-            page_number,
-            page_count,
-            dpi,
-            width,
-            height,
-            page_width,
-            page_height,
-            image = %image_path.display(),
-            json = %json_path.display(),
-            boxes = annotated.len(),
-            load_page_ms,
-            render_ms,
-            bitmap_ms,
-            detect_ms,
-            annotate_ms,
-            encode_png_ms,
-            write_png_ms,
-            serialize_json_ms,
-            write_json_ms,
-            total_page_ms,
-            "native page completed"
+            first_page = batch_start + 1,
+            last_page = batch_end,
+            pages = rendered_pages.len(),
+            batch_detect_ms,
+            total_batch_ms = batch_started.elapsed().as_secs_f64() * 1000.0,
+            "native batch completed"
         );
+
+        for (rendered, detections) in rendered_pages.iter_mut().zip(detections_by_page) {
+            let annotate_started = Instant::now();
+            let annotated = detections
+                .iter()
+                .map(AnnotatedDetection::from)
+                .collect::<Vec<_>>();
+
+            annotate_page_rgba(
+                &mut rendered.rgba,
+                rendered.width,
+                rendered.height,
+                rendered.page_width,
+                rendered.page_height,
+                &annotated,
+            );
+            let annotate_ms = annotate_started.elapsed().as_secs_f64() * 1000.0;
+
+            let encode_png_started = Instant::now();
+            let png_bytes = encode_png_rgba(&rendered.rgba, rendered.width, rendered.height)
+                .map_err(|error| format!("encode page {} PNG: {error}", rendered.page_number))?;
+            let encode_png_ms = encode_png_started.elapsed().as_secs_f64() * 1000.0;
+
+            let image_path = output_path_for_page(output_dir, rendered.page_number, "png");
+            let json_path = output_path_for_page(output_dir, rendered.page_number, "json");
+
+            let write_png_started = Instant::now();
+            fs::write(&image_path, png_bytes)
+                .map_err(|error| format!("write {}: {error}", image_path.display()))?;
+            let write_png_ms = write_png_started.elapsed().as_secs_f64() * 1000.0;
+
+            let serialize_json_started = Instant::now();
+            let json = NativePageOutput {
+                page_number: rendered.page_number,
+                width: rendered.width,
+                height: rendered.height,
+                page_width: rendered.page_width,
+                page_height: rendered.page_height,
+                dpi,
+                detections: &annotated,
+            };
+            let json = serde_json::to_vec_pretty(&json).map_err(|error| {
+                format!("serialize page {} JSON: {error}", rendered.page_number)
+            })?;
+            let serialize_json_ms = serialize_json_started.elapsed().as_secs_f64() * 1000.0;
+
+            let write_json_started = Instant::now();
+            fs::write(&json_path, json)
+                .map_err(|error| format!("write {}: {error}", json_path.display()))?;
+            let write_json_ms = write_json_started.elapsed().as_secs_f64() * 1000.0;
+
+            let total_page_ms = rendered.page_started.elapsed().as_secs_f64() * 1000.0;
+
+            tracing::event!(
+                Level::INFO,
+                page_number = rendered.page_number,
+                page_count,
+                dpi,
+                width = rendered.width,
+                height = rendered.height,
+                page_width = rendered.page_width,
+                page_height = rendered.page_height,
+                image = %image_path.display(),
+                json = %json_path.display(),
+                boxes = annotated.len(),
+                load_page_ms = rendered.load_page_ms,
+                render_ms = rendered.render_ms,
+                bitmap_ms = rendered.bitmap_ms,
+                detect_ms = batch_detect_ms,
+                batch_size = batch_end - batch_start,
+                annotate_ms,
+                encode_png_ms,
+                write_png_ms,
+                serialize_json_ms,
+                write_json_ms,
+                total_page_ms,
+                "native page completed"
+            );
+        }
+
+        batch_start = batch_end;
     }
 
     tracing::event!(
@@ -247,6 +310,34 @@ fn detect_pdf_to_dir(input_pdf: &Path, output_dir: &Path, dpi: f32) -> Result<()
     );
 
     Ok(())
+}
+
+struct RenderedPage {
+    page_started: Instant,
+    page_number: u32,
+    width: u32,
+    height: u32,
+    page_width: f32,
+    page_height: f32,
+    rgb: Vec<u8>,
+    rgba: Vec<u8>,
+    load_page_ms: f64,
+    render_ms: f64,
+    bitmap_ms: f64,
+}
+
+impl RenderedPage {
+    /// Borrows this rendered page as model input without copying image buffers.
+    fn image(&self, dpi: f32) -> PageImage<'_> {
+        PageImage {
+            rgb: &self.rgb,
+            width: self.width,
+            height: self.height,
+            page_width: self.page_width,
+            page_height: self.page_height,
+            dpi,
+        }
+    }
 }
 
 /// Encodes an RGBA page buffer as PNG bytes.
@@ -303,6 +394,7 @@ mod tests {
 
         assert_eq!(args.output_dir, Path::new("output"));
         assert_eq!(args.dpi, 96.0);
+        assert_eq!(args.batch_size, 1);
     }
 
     #[test]
@@ -315,6 +407,8 @@ mod tests {
             "out",
             "--dpi",
             "150",
+            "--batch-size",
+            "4",
         ])
         .unwrap();
 
@@ -322,6 +416,28 @@ mod tests {
 
         assert_eq!(args.output_dir, Path::new("out"));
         assert_eq!(args.dpi, 150.0);
+        assert_eq!(args.batch_size, 4);
+    }
+
+    #[test]
+    fn native_cli_detect_rejects_batch_size_outside_supported_range() {
+        let too_small = NativeCli::try_parse_from([
+            "doclayout-detector",
+            "detect",
+            "input.pdf",
+            "--batch-size",
+            "0",
+        ]);
+        let too_large = NativeCli::try_parse_from([
+            "doclayout-detector",
+            "detect",
+            "input.pdf",
+            "--batch-size",
+            "5",
+        ]);
+
+        assert!(too_small.is_err());
+        assert!(too_large.is_err());
     }
 
     #[test]

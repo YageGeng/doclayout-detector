@@ -59,6 +59,10 @@
         width: 68px;
       }
 
+      #batch-size {
+        width: 56px;
+      }
+
       button {
         min-height: 34px;
         padding: 0 12px;
@@ -90,6 +94,27 @@
         min-height: 24px;
         color: #55554f;
         font-size: 14px;
+      }
+
+      .run-meta {
+        display: grid;
+        grid-template-columns: minmax(160px, 1fr) auto;
+        gap: 10px;
+        align-items: center;
+        margin-top: 8px;
+      }
+
+      #progress {
+        width: 100%;
+        height: 12px;
+        accent-color: #1d1d1b;
+      }
+
+      #summary {
+        min-width: 170px;
+        color: #44443f;
+        font-size: 13px;
+        text-align: right;
       }
 
       #pages {
@@ -128,16 +153,24 @@
         z-index: 3;
         display: grid;
         gap: 7px;
-        width: 148px;
+        width: 132px;
         max-height: calc(100vh - 96px);
         padding: 10px;
-        overflow: auto;
+        overflow-x: hidden;
+        overflow-y: auto;
         border: 1px solid #d9d8d1;
         border-radius: 8px;
         background: rgba(255, 255, 255, 0.94);
         box-shadow: 0 10px 32px rgba(29, 29, 27, 0.12);
         transform: translateY(-50%);
         backdrop-filter: blur(8px);
+        cursor: grab;
+        user-select: none;
+        touch-action: none;
+      }
+
+      .legend.is-dragging {
+        cursor: grabbing;
       }
 
       .legend-title {
@@ -158,6 +191,11 @@
         line-height: 1.2;
       }
 
+      .legend-item span:last-child {
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+
       .legend-swatch {
         width: 12px;
         height: 12px;
@@ -176,7 +214,7 @@
 
         .legend {
           left: 8px;
-          width: 118px;
+          width: 116px;
           padding: 8px;
         }
 
@@ -196,12 +234,13 @@
         <button id="prev" class="secondary" disabled>Prev</button>
         <label>Page <input id="page" type="number" min="1" value="1" disabled /></label>
         <button id="next" class="secondary" disabled>Next</button>
+        <label>Batch <input id="batch-size" type="number" min="1" max="4" step="1" value="1" /></label>
         <button id="run" disabled>Detect</button>
         <button id="run-all" class="secondary" disabled>Detect All</button>
       </div>
     </header>
 
-    <aside class="legend" aria-label="Layout label legend">
+    <aside id="legend" class="legend" aria-label="Layout label legend">
       <p class="legend-title">Labels</p>
       <div class="legend-item"><span class="legend-swatch" style="background: #7c4dff"></span><span>abstract</span></div>
       <div class="legend-item"><span class="legend-swatch" style="background: #5c6bc0"></span><span>algorithm</span></div>
@@ -232,6 +271,10 @@
 
     <main>
       <div id="status">Build the wasm package, then choose a PDF.</div>
+      <div class="run-meta">
+        <progress id="progress" value="0" max="1"></progress>
+        <div id="summary">0 pages · 0.0s</div>
+      </div>
       <div id="pages"></div>
     </main>
 
@@ -241,22 +284,75 @@
       const fileInput = document.querySelector("#file");
       const dpiInput = document.querySelector("#dpi");
       const pageInput = document.querySelector("#page");
+      const batchSizeInput = document.querySelector("#batch-size");
       const prevButton = document.querySelector("#prev");
       const nextButton = document.querySelector("#next");
       const runButton = document.querySelector("#run");
       const runAllButton = document.querySelector("#run-all");
       const status = document.querySelector("#status");
+      const progress = document.querySelector("#progress");
+      const summary = document.querySelector("#summary");
+      const legend = document.querySelector("#legend");
       const pages = document.querySelector("#pages");
 
       let detector = null;
       let pdfBytes = null;
       let pageCount = 0;
       const pageCache = new Map();
+      let legendDrag = null;
 
       // Update the compact status line without using console output.
       function setStatus(message) {
         status.textContent = message;
       }
+
+      // Keep aggregate progress visible even when no run has started yet.
+      function setSummary(processedPages, totalPages, elapsedMs) {
+        summary.textContent = `${processedPages}/${totalPages} pages · ${(elapsedMs / 1000).toFixed(1)}s`;
+      }
+
+      // Keep the floating legend inside the viewport after drag updates.
+      function clampLegendPosition(left, top) {
+        const rect = legend.getBoundingClientRect();
+        const maxLeft = Math.max(window.innerWidth - rect.width - 4, 4);
+        const maxTop = Math.max(window.innerHeight - rect.height - 4, 4);
+        return {
+          left: Math.min(Math.max(left, 4), maxLeft),
+          top: Math.min(Math.max(top, 4), maxTop),
+        };
+      }
+
+      legend.addEventListener("pointerdown", (event) => {
+        const rect = legend.getBoundingClientRect();
+        legendDrag = {
+          pointerId: event.pointerId,
+          offsetX: event.clientX - rect.left,
+          offsetY: event.clientY - rect.top,
+        };
+        legend.classList.add("is-dragging");
+        legend.setPointerCapture(event.pointerId);
+        event.preventDefault();
+      });
+
+      window.addEventListener("pointermove", (event) => {
+        if (!legendDrag || event.pointerId !== legendDrag.pointerId) return;
+        const position = clampLegendPosition(
+          event.clientX - legendDrag.offsetX,
+          event.clientY - legendDrag.offsetY,
+        );
+        const nextLeft = position.left;
+        const nextTop = position.top;
+        legend.style.left = `${nextLeft}px`;
+        legend.style.top = `${nextTop}px`;
+        legend.style.transform = "none";
+      });
+
+      window.addEventListener("pointerup", (event) => {
+        if (!legendDrag || event.pointerId !== legendDrag.pointerId) return;
+        legend.classList.remove("is-dragging");
+        legend.releasePointerCapture(event.pointerId);
+        legendDrag = null;
+      });
 
       // Keep controls disabled while detection is running or inputs are absent.
       function setBusy(isBusy) {
@@ -264,6 +360,7 @@
         fileInput.disabled = isBusy;
         dpiInput.disabled = isBusy;
         pageInput.disabled = isBusy || !ready;
+        batchSizeInput.disabled = isBusy;
         prevButton.disabled = isBusy || !ready || currentPageNumber() <= 1;
         nextButton.disabled = isBusy || !ready || currentPageNumber() >= pageCount;
         runButton.disabled = isBusy || !ready;
@@ -277,9 +374,23 @@
         return Math.min(Math.max(Math.trunc(rawPage), 1), Math.max(pageCount, 1));
       }
 
+      // Read and clamp the Detect All batch size to the supported memory-safe range.
+      function currentBatchSize() {
+        const rawBatchSize = Number(batchSizeInput.value || 1);
+        if (!Number.isFinite(rawBatchSize)) return 1;
+        return Math.min(Math.max(Math.trunc(rawBatchSize), 1), 4);
+      }
+
       // Build a cache key that accounts for DPI because it changes render size.
       function pageCacheKey(pageNumber, dpi) {
         return `${pageNumber}:${dpi}`;
+      }
+
+      // Reset aggregate progress when a new file or single-page run starts.
+      function resetProgress(totalPages = pageCount) {
+        progress.max = Math.max(totalPages, 1);
+        progress.value = 0;
+        setSummary(0, totalPages, 0);
       }
 
       // Configure page controls after a new PDF is available.
@@ -287,6 +398,7 @@
         pageCount = count;
         pageInput.max = String(Math.max(count, 1));
         pageInput.value = "1";
+        resetProgress(count);
         setBusy(false);
       }
 
@@ -297,6 +409,9 @@
         pages.replaceChildren();
         appendPage(cached);
         setStatus(`Showing cached page ${pageNumber} of ${pageCount}.`);
+        progress.max = Math.max(pageCount, 1);
+        progress.value = 1;
+        setSummary(1, pageCount, 0);
         return true;
       }
 
@@ -326,6 +441,7 @@
         if (!file) {
           pdfBytes = null;
           pageCount = 0;
+          resetProgress(0);
           setBusy(false);
           setStatus("Choose a PDF to detect layout boxes.");
           return;
@@ -365,6 +481,7 @@
         const pageNumber = currentPageNumber();
         if (showCachedPage(pageNumber, dpi)) return;
         setBusy(true);
+        resetProgress(pageCount);
 
         try {
           pages.replaceChildren();
@@ -374,6 +491,8 @@
           pageCache.set(pageCacheKey(pageNumber, dpi), page);
           appendPage(page);
           const pageMs = Math.round(performance.now() - pageStartedAt);
+          progress.value = 1;
+          setSummary(1, pageCount, pageMs);
           setStatus(`Detected page ${pageNumber} of ${pageCount} in ${pageMs} ms.`);
         } catch (error) {
           setStatus(error instanceof Error ? error.message : String(error));
@@ -388,19 +507,27 @@
 
         setBusy(true);
         pages.replaceChildren();
+        resetProgress(pageCount);
 
         try {
           const dpi = Number(dpiInput.value || 96);
+          const batchSize = currentBatchSize();
           const startedAt = performance.now();
-          for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
-            pageInput.value = String(pageNumber);
-            setStatus(`Detecting page ${pageNumber} of ${pageCount}...`);
-            const pageStartedAt = performance.now();
-            const page = await detector.detectLoadedPage(pageNumber, dpi);
-            pageCache.set(pageCacheKey(pageNumber, dpi), page);
-            appendPage(page);
-            const pageMs = Math.round(performance.now() - pageStartedAt);
-            setStatus(`Detected page ${pageNumber} of ${pageCount} in ${pageMs} ms.`);
+          progress.max = pageCount;
+          let processedPages = 0;
+          for (let startPage = 1; startPage <= pageCount; startPage += batchSize) {
+            const count = Math.min(batchSize, pageCount - startPage + 1);
+            const endPage = startPage + count - 1;
+            pageInput.value = String(startPage);
+            setStatus(`Detecting pages ${startPage}-${endPage} of ${pageCount}...`);
+            const batch = await detector.detectLoadedPages(startPage, count, dpi);
+            for (const page of batch) {
+              pageCache.set(pageCacheKey(page.pageNumber, dpi), page);
+              appendPage(page);
+              processedPages += 1;
+              progress.value = processedPages;
+              setSummary(processedPages, pageCount, performance.now() - startedAt);
+            }
           }
           const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
           setStatus(`Finished ${pageCount} pages in ${elapsedSeconds}s.`);

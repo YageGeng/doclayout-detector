@@ -11,8 +11,41 @@ pub fn decode_box_detections(
     image: &PageImage<'_>,
     threshold: f32,
 ) -> Result<Vec<PPDocLayoutV3Detection>, LayoutError> {
-    validate_shapes(outputs)?;
+    let mut pages = decode_box_detections_batch(outputs, std::slice::from_ref(image), threshold)?;
+    Ok(pages.remove(0))
+}
 
+/// Decodes batched PP-DocLayoutV3 tensors into per-page detections.
+pub fn decode_box_detections_batch(
+    outputs: &PPDocLayoutV3RawOutputs<'_>,
+    images: &[PageImage<'_>],
+    threshold: f32,
+) -> Result<Vec<Vec<PPDocLayoutV3Detection>>, LayoutError> {
+    validate_shapes(outputs)?;
+    if outputs.batch_size() != images.len() {
+        return Err(LayoutError::InvalidModelOutput(format!(
+            "expected {} page images for output batch {}, got {}",
+            outputs.batch_size(),
+            outputs.batch_size(),
+            images.len()
+        )));
+    }
+
+    images
+        .iter()
+        .enumerate()
+        .map(|(batch_index, image)| {
+            decode_box_detections_for_page(&outputs.page(batch_index)?, image, threshold)
+        })
+        .collect()
+}
+
+/// Decodes one already-sliced output page into page-space detections.
+fn decode_box_detections_for_page(
+    outputs: &PPDocLayoutV3RawOutputs<'_>,
+    image: &PageImage<'_>,
+    threshold: f32,
+) -> Result<Vec<PPDocLayoutV3Detection>, LayoutError> {
     let order_seq = outputs
         .order_logits
         .map(compute_order_sequence)
@@ -99,44 +132,51 @@ pub fn decode_box_detections(
     Ok(detections)
 }
 
-/// Verifies that model output tensors match the checkpoint's fixed query and class shapes.
+/// Verifies that batched model output tensors match the checkpoint's fixed per-page shape.
 fn validate_shapes(outputs: &PPDocLayoutV3RawOutputs<'_>) -> Result<(), LayoutError> {
     let class_count = PPDocLayoutV3Label::class_count();
-    if outputs.logits_shape != [1, NUM_QUERIES, class_count] {
+    let batch_size = outputs.batch_size();
+    if batch_size == 0 {
+        return Err(LayoutError::InvalidModelOutput(
+            "output batch size must be greater than zero".to_string(),
+        ));
+    }
+    if outputs.logits_shape != [batch_size, NUM_QUERIES, class_count] {
         return Err(LayoutError::InvalidModelOutput(format!(
-            "expected logits [1, {NUM_QUERIES}, {class_count}], got {:?}",
+            "expected logits [{batch_size}, {NUM_QUERIES}, {class_count}], got {:?}",
             outputs.logits_shape
         )));
     }
-    if outputs.logits.len() != NUM_QUERIES * class_count {
+    if outputs.logits.len() != batch_size * NUM_QUERIES * class_count {
         return Err(LayoutError::InvalidModelOutput(format!(
             "expected {} logits, got {}",
-            NUM_QUERIES * class_count,
+            batch_size * NUM_QUERIES * class_count,
             outputs.logits.len()
         )));
     }
-    if outputs.pred_boxes_shape != [1, NUM_QUERIES, 4] {
+    if outputs.pred_boxes_shape != [batch_size, NUM_QUERIES, 4] {
         return Err(LayoutError::InvalidModelOutput(format!(
-            "expected pred_boxes [1, {NUM_QUERIES}, 4], got {:?}",
+            "expected pred_boxes [{batch_size}, {NUM_QUERIES}, 4], got {:?}",
             outputs.pred_boxes_shape
         )));
     }
-    if outputs.pred_boxes.len() != NUM_QUERIES * 4 {
+    if outputs.pred_boxes.len() != batch_size * NUM_QUERIES * 4 {
         return Err(LayoutError::InvalidModelOutput(format!(
             "expected {} pred box values, got {}",
-            NUM_QUERIES * 4,
+            batch_size * NUM_QUERIES * 4,
             outputs.pred_boxes.len()
         )));
     }
     match (outputs.order_logits_shape, outputs.order_logits) {
-        (Some([1, NUM_QUERIES, NUM_QUERIES]), Some(values))
-            if values.len() == NUM_QUERIES * NUM_QUERIES =>
+        (Some([shape_batch, NUM_QUERIES, NUM_QUERIES]), Some(values))
+            if shape_batch == batch_size
+                && values.len() == batch_size * NUM_QUERIES * NUM_QUERIES =>
         {
             Ok(())
         }
         (None, None) => Ok(()),
         (shape, values) => Err(LayoutError::InvalidModelOutput(format!(
-            "expected order_logits [1, {NUM_QUERIES}, {NUM_QUERIES}], got shape {shape:?} and {} values",
+            "expected order_logits [{batch_size}, {NUM_QUERIES}, {NUM_QUERIES}], got shape {shape:?} and {} values",
             values.map_or(0, <[f32]>::len)
         ))),
     }

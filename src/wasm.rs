@@ -113,6 +113,35 @@ impl PPDocLayoutWasm {
         self.detect_rendered_page(detector, rendered, page_number, dpi)
             .await
     }
+
+    #[wasm_bindgen(js_name = detectLoadedPages)]
+    /// Renders and detects a contiguous batch from the PDF previously stored by `loadPdf`.
+    pub async fn detect_loaded_pages(
+        &self,
+        start_page: u32,
+        count: u32,
+        dpi: f32,
+    ) -> Result<JsValue, JsError> {
+        let detector = self.detector().await?;
+        let render_started = WasmTimer::start();
+        let rendered_pages = {
+            let pdf_data = self.pdf_data.borrow();
+            let data = pdf_data
+                .as_deref()
+                .ok_or_else(|| JsError::new("no PDF loaded; call loadPdf first"))?;
+            render_pdf_pages(data, start_page, count, dpi)?
+        };
+        tracing::event!(
+            Level::INFO,
+            start_page,
+            count,
+            dpi,
+            duration_ms = render_started.elapsed_ms(),
+            "wasm page batch render completed"
+        );
+        self.detect_rendered_pages(detector, rendered_pages, dpi)
+            .await
+    }
 }
 
 impl PPDocLayoutWasm {
@@ -194,6 +223,93 @@ impl PPDocLayoutWasm {
         Ok(value)
     }
 
+    /// Runs batched detection, annotation, PNG encoding, and JS serialization for rendered pages.
+    async fn detect_rendered_pages(
+        &self,
+        detector: PPDocLayoutV3Detector<EmbeddedModel>,
+        mut rendered_pages: Vec<(u32, RenderedPage)>,
+        dpi: f32,
+    ) -> Result<JsValue, JsError> {
+        let total_started = WasmTimer::start();
+        let images = rendered_pages
+            .iter()
+            .map(|(_, rendered)| rendered.image(dpi))
+            .collect::<Vec<_>>();
+
+        let detect_started = WasmTimer::start();
+        let detections_by_page = detector
+            .detect_pages_async(&images)
+            .await
+            .map_err(|error| JsError::new(&format!("layout batch detection failed: {error}")))?;
+        let detect_ms = detect_started.elapsed_ms();
+        drop(images);
+
+        let mut results = Vec::with_capacity(rendered_pages.len());
+        for ((page_number, rendered), detections) in
+            rendered_pages.drain(..).zip(detections_by_page)
+        {
+            let annotate_started = WasmTimer::start();
+            let annotated = detections
+                .iter()
+                .map(AnnotatedDetection::from)
+                .collect::<Vec<_>>();
+            let mut rgba = rendered.rgba;
+            annotate_page_rgba(
+                &mut rgba,
+                rendered.width,
+                rendered.height,
+                rendered.page_width,
+                rendered.page_height,
+                &annotated,
+            );
+            let annotate_ms = annotate_started.elapsed_ms();
+
+            let encode_started = WasmTimer::start();
+            let png_bytes = encode_png_rgba(&rgba, rendered.width, rendered.height)?;
+            let encode_png_ms = encode_started.elapsed_ms();
+
+            tracing::event!(
+                Level::INFO,
+                page_number,
+                dpi,
+                width = rendered.width,
+                height = rendered.height,
+                detections = annotated.len(),
+                image_bytes = png_bytes.len(),
+                detect_ms,
+                annotate_ms,
+                encode_png_ms,
+                "wasm page batch item completed"
+            );
+
+            results.push(WasmOwnedPageResult {
+                page_number,
+                width: rendered.width,
+                height: rendered.height,
+                page_width: rendered.page_width,
+                page_height: rendered.page_height,
+                detections: annotated,
+                image_bytes: png_bytes,
+            });
+        }
+
+        let serialize_started = WasmTimer::start();
+        let value = serde_wasm_bindgen::to_value(&results)
+            .map_err(|error| JsError::new(&format!("failed to encode batch result: {error}")))?;
+        let serialize_ms = serialize_started.elapsed_ms();
+
+        tracing::event!(
+            Level::INFO,
+            pages = results.len(),
+            detect_ms,
+            serialize_ms,
+            total_ms = total_started.elapsed_ms(),
+            "wasm page batch pipeline completed"
+        );
+
+        Ok(value)
+    }
+
     /// Lazily initializes and caches the layout detector used by wasm entrypoints.
     async fn detector(&self) -> Result<PPDocLayoutV3Detector<EmbeddedModel>, JsError> {
         if let Some(detector) = self.detector.borrow().clone() {
@@ -224,6 +340,20 @@ struct RenderedPage {
     rgba: Vec<u8>,
 }
 
+impl RenderedPage {
+    /// Borrows this rendered page as model input without copying pixel buffers.
+    fn image(&self, dpi: f32) -> PageImage<'_> {
+        PageImage {
+            rgb: &self.rgb,
+            width: self.width,
+            height: self.height,
+            page_width: self.page_width,
+            page_height: self.page_height,
+            dpi,
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WasmPageResult<'a> {
@@ -237,6 +367,19 @@ struct WasmPageResult<'a> {
     image_bytes: &'a [u8],
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmOwnedPageResult {
+    page_number: u32,
+    width: u32,
+    height: u32,
+    page_width: f32,
+    page_height: f32,
+    detections: Vec<AnnotatedDetection>,
+    #[serde(with = "serde_bytes")]
+    image_bytes: Vec<u8>,
+}
+
 /// Counts pages in a PDF byte buffer using Pdfium.
 fn pdf_page_count(data: &[u8]) -> Result<u32, JsError> {
     let lib = Library::init();
@@ -248,11 +391,28 @@ fn pdf_page_count(data: &[u8]) -> Result<u32, JsError> {
 
 /// Renders a one-based PDF page into RGB input bytes and RGBA display bytes.
 fn render_pdf_page(data: &[u8], page_number: u32, dpi: f32) -> Result<RenderedPage, JsError> {
-    if page_number == 0 {
+    let mut pages = render_pdf_pages(data, page_number, 1, dpi)?;
+    Ok(pages.remove(0).1)
+}
+
+/// Renders a contiguous one-based PDF page range into RGB/RGBA page buffers.
+fn render_pdf_pages(
+    data: &[u8],
+    start_page: u32,
+    count: u32,
+    dpi: f32,
+) -> Result<Vec<(u32, RenderedPage)>, JsError> {
+    if start_page == 0 {
         return Err(JsError::new(
-            "pageNumber is 1-based and must be greater than 0",
+            "startPage is 1-based and must be greater than 0",
         ));
     }
+    if count == 0 {
+        return Err(JsError::new("count must be greater than 0"));
+    }
+    let end_page = start_page
+        .checked_add(count - 1)
+        .ok_or_else(|| JsError::new("page range overflow"))?;
 
     let load_started = WasmTimer::start();
     let lib = Library::init();
@@ -262,65 +422,74 @@ fn render_pdf_page(data: &[u8], page_number: u32, dpi: f32) -> Result<RenderedPa
     let page_count = document.page_count() as u32;
     tracing::event!(
         Level::INFO,
-        page_number,
+        start_page,
+        end_page,
         page_count,
         duration_ms = load_started.elapsed_ms(),
-        "wasm PDF document loaded for page render"
+        "wasm PDF document loaded for page batch render"
     );
-    if page_number > page_count {
+    if end_page > page_count {
         return Err(JsError::new(&format!(
-            "page {page_number} out of range; document has {page_count} pages"
+            "page range {start_page}-{end_page} out of range; document has {page_count} pages"
         )));
     }
 
-    let page_started = WasmTimer::start();
-    let page = document
-        .page((page_number - 1) as i32)
-        .map_err(|error| JsError::new(&format!("failed to load page {page_number}: {error}")))?;
-    let page_width = page.width();
-    let page_height = page.height();
-    tracing::event!(
-        Level::INFO,
-        page_number,
-        page_width,
-        page_height,
-        duration_ms = page_started.elapsed_ms(),
-        "wasm PDF page loaded"
-    );
+    let mut pages = Vec::with_capacity(count as usize);
+    for page_number in start_page..=end_page {
+        let page_started = WasmTimer::start();
+        let page = document.page((page_number - 1) as i32).map_err(|error| {
+            JsError::new(&format!("failed to load page {page_number}: {error}"))
+        })?;
+        let page_width = page.width();
+        let page_height = page.height();
+        tracing::event!(
+            Level::INFO,
+            page_number,
+            page_width,
+            page_height,
+            duration_ms = page_started.elapsed_ms(),
+            "wasm PDF page loaded"
+        );
 
-    let raster_started = WasmTimer::start();
-    let bitmap = page
-        .render(dpi)
-        .map_err(|error| JsError::new(&format!("failed to render page {page_number}: {error}")))?;
-    tracing::event!(
-        Level::INFO,
-        page_number,
-        dpi,
-        width = bitmap.width(),
-        height = bitmap.height(),
-        duration_ms = raster_started.elapsed_ms(),
-        "wasm PDF page rasterized"
-    );
+        let raster_started = WasmTimer::start();
+        let bitmap = page.render(dpi).map_err(|error| {
+            JsError::new(&format!("failed to render page {page_number}: {error}"))
+        })?;
+        tracing::event!(
+            Level::INFO,
+            page_number,
+            dpi,
+            width = bitmap.width(),
+            height = bitmap.height(),
+            duration_ms = raster_started.elapsed_ms(),
+            "wasm PDF page rasterized"
+        );
 
-    let bitmap_started = WasmTimer::start();
-    let (rgb, rgba) = bitmap_to_rgb_and_rgba(&bitmap);
-    tracing::event!(
-        Level::INFO,
-        page_number,
-        rgb_bytes = rgb.len(),
-        rgba_bytes = rgba.len(),
-        duration_ms = bitmap_started.elapsed_ms(),
-        "wasm bitmap converted"
-    );
+        let bitmap_started = WasmTimer::start();
+        let (rgb, rgba) = bitmap_to_rgb_and_rgba(&bitmap);
+        tracing::event!(
+            Level::INFO,
+            page_number,
+            rgb_bytes = rgb.len(),
+            rgba_bytes = rgba.len(),
+            duration_ms = bitmap_started.elapsed_ms(),
+            "wasm bitmap converted"
+        );
 
-    Ok(RenderedPage {
-        width: bitmap.width() as u32,
-        height: bitmap.height() as u32,
-        page_width,
-        page_height,
-        rgb,
-        rgba,
-    })
+        pages.push((
+            page_number,
+            RenderedPage {
+                width: bitmap.width() as u32,
+                height: bitmap.height() as u32,
+                page_width,
+                page_height,
+                rgb,
+                rgba,
+            },
+        ));
+    }
+
+    Ok(pages)
 }
 
 /// Converts Pdfium BGRA bitmap rows into RGB model input and RGBA annotation buffers.

@@ -105,20 +105,38 @@ impl EmbeddedModel {
 impl PPDocLayoutV3Inference for EmbeddedModel {
     /// Runs synchronous model inference and copies tensor outputs back to owned host buffers.
     fn infer(&self, input: &[f32]) -> Result<PPDocLayoutV3OwnedOutputs, LayoutError> {
-        let expected =
-            3 * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize;
+        self.infer_batch(input, 1)
+    }
+
+    /// Runs synchronous batched inference and copies tensor outputs back to owned host buffers.
+    fn infer_batch(
+        &self,
+        input: &[f32],
+        batch_size: usize,
+    ) -> Result<PPDocLayoutV3OwnedOutputs, LayoutError> {
+        if batch_size == 0 {
+            return Err(LayoutError::InvalidModelOutput(
+                "batch size must be greater than zero".to_string(),
+            ));
+        }
+        let expected = batch_size
+            * 3
+            * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize
+            * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize;
         if input.len() != expected {
             return Err(LayoutError::InvalidModelOutput(format!(
-                "expected CHW input length {expected}, got {}",
+                "expected batched CHW input length {expected}, got {}",
                 input.len()
             )));
         }
 
+        // The model supports a dynamic batch dimension while keeping the fixed
+        // official page shape of 3x800x800 for every item in the batch.
         let tensor = Tensor::<LayoutBackend, 4>::from_data(
             TensorData::new(
                 input.to_vec(),
                 [
-                    1,
+                    batch_size,
                     3,
                     PP_DOCLAYOUT_V3_IMAGE_SIZE as usize,
                     PP_DOCLAYOUT_V3_IMAGE_SIZE as usize,
@@ -167,11 +185,27 @@ impl EmbeddedModel {
         &self,
         input: &[f32],
     ) -> Result<PPDocLayoutV3OwnedOutputs, LayoutError> {
-        let expected =
-            3 * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize;
+        self.infer_batch_async(input, 1).await
+    }
+
+    /// Runs browser WebGPU batched inference with async tensor readbacks.
+    pub async fn infer_batch_async(
+        &self,
+        input: &[f32],
+        batch_size: usize,
+    ) -> Result<PPDocLayoutV3OwnedOutputs, LayoutError> {
+        if batch_size == 0 {
+            return Err(LayoutError::InvalidModelOutput(
+                "batch size must be greater than zero".to_string(),
+            ));
+        }
+        let expected = batch_size
+            * 3
+            * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize
+            * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize;
         if input.len() != expected {
             return Err(LayoutError::InvalidModelOutput(format!(
-                "expected CHW input length {expected}, got {}",
+                "expected batched CHW input length {expected}, got {}",
                 input.len()
             )));
         }
@@ -181,7 +215,7 @@ impl EmbeddedModel {
             TensorData::new(
                 input.to_vec(),
                 [
-                    1,
+                    batch_size,
                     3,
                     PP_DOCLAYOUT_V3_IMAGE_SIZE as usize,
                     PP_DOCLAYOUT_V3_IMAGE_SIZE as usize,

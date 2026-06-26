@@ -40,3 +40,14 @@ test("wasm proposal top-k avoids unsupported WebGPU sorting", async () => {
   assert.match(asyncTopk, /host_topk_indices_from_values/);
   assert.doesNotMatch(asyncTopk, /topk_with_indices/);
 });
+
+test("wasm exposes loaded page batch detection", async () => {
+  const wasm = await readFile("src/wasm.rs", "utf8");
+  const detector = await readFile("src/pp_doclayout/detector.rs", "utf8");
+
+  assert.match(wasm, /js_name = detectLoadedPages/);
+  assert.match(wasm, /detect_loaded_pages/);
+  assert.match(wasm, /detect_rendered_pages/);
+  assert.match(detector, /detect_pages_async/);
+  assert.match(detector, /infer_batch_async/);
+});

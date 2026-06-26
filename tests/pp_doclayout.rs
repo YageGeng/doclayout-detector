@@ -4,7 +4,8 @@ use doclayout_detector::PageImage;
 use doclayout_detector::pp_doclayout::{
     PP_DOCLAYOUT_V3_IMAGE_SIZE, PPDocLayoutV3Config, PPDocLayoutV3Detection, PPDocLayoutV3Detector,
     PPDocLayoutV3Inference, PPDocLayoutV3Label, PPDocLayoutV3Options, PPDocLayoutV3OwnedOutputs,
-    PPDocLayoutV3RawOutputs, decode_box_detections, resize_rgb_to_chw_f32,
+    PPDocLayoutV3RawOutputs, decode_box_detections, decode_box_detections_batch,
+    resize_rgb_to_chw_f32,
 };
 
 fn page_image<'a>(rgb: &'a [u8], width: u32, height: u32) -> PageImage<'a> {
@@ -124,6 +125,49 @@ fn pp_doclayout_box_postprocess_applies_sigmoid_topk_scale_and_order() {
 }
 
 #[test]
+fn pp_doclayout_box_postprocess_decodes_batched_outputs_per_page() {
+    let first_rgb = vec![255; 20 * 10 * 3];
+    let second_rgb = vec![128; 40 * 20 * 3];
+    let first_image = page_image(&first_rgb, 20, 10);
+    let second_image = page_image(&second_rgb, 40, 20);
+    let mut logits = vec![-20.0; 2 * 300 * 25];
+    let mut pred_boxes = vec![0.0; 2 * 300 * 4];
+
+    logits[5 * 25 + 22] = 6.0;
+    pred_boxes[5 * 4] = 0.50;
+    pred_boxes[5 * 4 + 1] = 0.50;
+    pred_boxes[5 * 4 + 2] = 0.50;
+    pred_boxes[5 * 4 + 3] = 0.50;
+
+    let second_logits_offset = 300 * 25;
+    let second_boxes_offset = 300 * 4;
+    logits[second_logits_offset + 9 * 25 + 21] = 7.0;
+    pred_boxes[second_boxes_offset + 9 * 4] = 0.25;
+    pred_boxes[second_boxes_offset + 9 * 4 + 1] = 0.25;
+    pred_boxes[second_boxes_offset + 9 * 4 + 2] = 0.50;
+    pred_boxes[second_boxes_offset + 9 * 4 + 3] = 0.50;
+
+    let detections = decode_box_detections_batch(
+        &PPDocLayoutV3RawOutputs {
+            logits_shape: [2, 300, 25],
+            logits: &logits,
+            pred_boxes_shape: [2, 300, 4],
+            pred_boxes: &pred_boxes,
+            order_logits_shape: None,
+            order_logits: None,
+        },
+        &[first_image, second_image],
+        0.5,
+    )
+    .unwrap();
+
+    assert_eq!(detections.len(), 2);
+    assert_eq!(detections[0][0].label, PPDocLayoutV3Label::Text);
+    assert_eq!(detections[1][0].label, PPDocLayoutV3Label::Table);
+    assert!((detections[1][0].width - 10.0).abs() < 0.001);
+}
+
+#[test]
 fn pp_doclayout_uses_official_input_size() {
     assert_eq!(PP_DOCLAYOUT_V3_IMAGE_SIZE, 800);
 }
@@ -218,4 +262,64 @@ fn pp_doclayout_detector_runs_preprocess_inference_and_postprocess() {
     assert_eq!(detections[0].label, PPDocLayoutV3Label::Text);
     assert!((detections[0].x - 2.5).abs() < 0.001);
     assert!((detections[0].height - 2.5).abs() < 0.001);
+}
+
+#[test]
+fn pp_doclayout_detector_runs_batched_preprocess_inference_and_postprocess() {
+    struct FakeBatchInference;
+
+    impl PPDocLayoutV3Inference for FakeBatchInference {
+        fn infer(&self, input: &[f32]) -> Result<PPDocLayoutV3OwnedOutputs, LayoutError> {
+            self.infer_batch(input, 1)
+        }
+
+        fn infer_batch(
+            &self,
+            input: &[f32],
+            batch_size: usize,
+        ) -> Result<PPDocLayoutV3OwnedOutputs, LayoutError> {
+            assert_eq!(batch_size, 2);
+            assert_eq!(
+                input.len(),
+                2 * 3 * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize
+            );
+            let mut logits = vec![-20.0; 2 * 300 * 25];
+            let mut pred_boxes = vec![0.0; 2 * 300 * 4];
+
+            logits[5 * 25 + 22] = 6.0;
+            pred_boxes[5 * 4] = 0.50;
+            pred_boxes[5 * 4 + 1] = 0.50;
+            pred_boxes[5 * 4 + 2] = 0.50;
+            pred_boxes[5 * 4 + 3] = 0.50;
+
+            let second_logits_offset = 300 * 25;
+            let second_boxes_offset = 300 * 4;
+            logits[second_logits_offset + 9 * 25 + 21] = 7.0;
+            pred_boxes[second_boxes_offset + 9 * 4] = 0.50;
+            pred_boxes[second_boxes_offset + 9 * 4 + 1] = 0.50;
+            pred_boxes[second_boxes_offset + 9 * 4 + 2] = 0.50;
+            pred_boxes[second_boxes_offset + 9 * 4 + 3] = 0.50;
+
+            Ok(PPDocLayoutV3OwnedOutputs {
+                logits_shape: [2, 300, 25],
+                logits,
+                pred_boxes_shape: [2, 300, 4],
+                pred_boxes,
+                order_logits_shape: None,
+                order_logits: None,
+            })
+        }
+    }
+
+    let first_rgb = vec![255; 20 * 10 * 3];
+    let second_rgb = vec![128; 40 * 20 * 3];
+    let first_image = page_image(&first_rgb, 20, 10);
+    let second_image = page_image(&second_rgb, 40, 20);
+    let detector = PPDocLayoutV3Detector::new(FakeBatchInference, PPDocLayoutV3Options::default());
+
+    let detections = detector.detect_pages(&[first_image, second_image]).unwrap();
+
+    assert_eq!(detections.len(), 2);
+    assert_eq!(detections[0][0].label, PPDocLayoutV3Label::Text);
+    assert_eq!(detections[1][0].label, PPDocLayoutV3Label::Table);
 }
