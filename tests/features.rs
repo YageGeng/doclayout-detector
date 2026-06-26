@@ -12,7 +12,12 @@ fn package_name_matches_doclayout_detector_project() {
 fn panic_hook_is_enabled_by_webgpu_not_by_default() {
     let features = parse_cargo_features(include_str!("../Cargo.toml"));
 
-    assert_feature_items(&features, "default", &["backend-ndarray"]);
+    assert_feature_items(
+        &features,
+        "default",
+        &["backend-vulkan", "dep:clap", "dep:pdfium", "dep:png"],
+    );
+    assert!(!features.contains_key("native-cli"));
     assert_feature_contains(&features, "backend-webgpu", "panic_hook");
 }
 

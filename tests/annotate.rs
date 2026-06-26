@@ -7,6 +7,7 @@ fn annotation_maps_pdf_points_to_rendered_pixels() {
     let detections = [AnnotatedDetection {
         label: PPDocLayoutV3Label::Text,
         confidence: 0.91,
+        order: 0,
         x: 10.0,
         y: 20.0,
         width: 30.0,
@@ -32,6 +33,7 @@ fn annotation_ignores_out_of_bounds_edges_without_resizing_buffer() {
     let detections = [AnnotatedDetection {
         label: PPDocLayoutV3Label::Table,
         confidence: 0.80,
+        order: 0,
         x: -10.0,
         y: -10.0,
         width: 40.0,
@@ -50,6 +52,7 @@ fn annotation_uses_pp_doclayout_label_enum_colors() {
     let detections = [AnnotatedDetection {
         label: PPDocLayoutV3Label::DocTitle,
         confidence: 0.80,
+        order: 0,
         x: 2.0,
         y: 2.0,
         width: 8.0,

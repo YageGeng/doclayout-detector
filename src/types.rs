@@ -32,6 +32,8 @@ pub struct LayoutDetection {
     pub label: PPDocLayoutV3Label,
     /// Model confidence score for the predicted label.
     pub confidence: f32,
+    /// Reading-order rank derived from the model's pairwise order logits.
+    pub order: usize,
     /// Left position in PDF page coordinates.
     pub x: f32,
     /// Top position in PDF page coordinates.

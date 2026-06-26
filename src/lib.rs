@@ -1,8 +1,6 @@
 mod annotate;
 pub mod error;
 pub mod model;
-#[cfg(all(not(target_arch = "wasm32"), feature = "native-cli"))]
-pub mod native;
 pub mod pp_doclayout;
 pub mod preprocess;
 pub mod types;

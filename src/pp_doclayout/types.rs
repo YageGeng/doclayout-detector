@@ -51,6 +51,7 @@ impl From<PPDocLayoutV3Detection> for crate::types::LayoutDetection {
         Self {
             label: value.label,
             confidence: value.confidence,
+            order: value.order,
             x: value.x,
             y: value.y,
             width: value.width,

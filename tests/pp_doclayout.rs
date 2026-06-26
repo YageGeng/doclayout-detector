@@ -158,7 +158,25 @@ fn pp_doclayout_detection_converts_to_annotated_detection() {
 
     assert_eq!(annotated.label, PPDocLayoutV3Label::DocTitle);
     assert_eq!(annotated.confidence, 0.75);
+    assert_eq!(annotated.order, 3);
     assert_eq!(annotated.x, 10.0);
+}
+
+#[test]
+fn pp_doclayout_detection_converts_to_layout_detection_with_order() {
+    let detection = PPDocLayoutV3Detection {
+        label: PPDocLayoutV3Label::Text,
+        confidence: 0.88,
+        order: 9,
+        x: 11.0,
+        y: 12.0,
+        width: 13.0,
+        height: 14.0,
+    };
+
+    let layout = doclayout_detector::LayoutDetection::from(detection);
+
+    assert_eq!(layout.order, 9);
 }
 
 #[test]

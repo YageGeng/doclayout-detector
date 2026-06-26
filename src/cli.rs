@@ -1,7 +1,4 @@
-use crate::PageImage;
-use crate::annotate::{AnnotatedDetection, annotate_page_rgba};
-use crate::model::EmbeddedModel;
-use crate::pp_doclayout::{PPDocLayoutV3Detector, PPDocLayoutV3Options};
+use clap::{Args, Parser, Subcommand};
 use pdfium::Library;
 use serde::Serialize;
 use std::fs;
@@ -9,52 +6,72 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::Level;
 
+use doclayout_detector::model::EmbeddedModel;
+use doclayout_detector::pp_doclayout::{PPDocLayoutV3Detector, PPDocLayoutV3Options};
+use doclayout_detector::{AnnotatedDetection, PageImage, annotate_page_rgba};
+
 const DEFAULT_DPI: f32 = 96.0;
 
-#[derive(Debug, Clone, PartialEq)]
-struct NativeCliArgs {
+#[derive(Debug, Clone, PartialEq, Parser)]
+#[command(author, version, about = "Detect document layout boxes in PDF pages.")]
+struct NativeCli {
+    #[command(subcommand)]
+    command: NativeCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+enum NativeCommand {
+    Detect(DetectArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Args)]
+struct DetectArgs {
     input_pdf: PathBuf,
+    #[arg(short = 'o', long = "output-dir", default_value = "output")]
     output_dir: PathBuf,
+    #[arg(long, default_value_t = DEFAULT_DPI)]
     dpi: f32,
 }
 
-impl NativeCliArgs {
-    /// Parse CLI arguments and return `None` when usage should be shown.
-    fn from_args(args: &[String]) -> Result<Option<Self>, String> {
-        let Some(input_pdf) = args.get(1) else {
-            return Ok(None);
-        };
-        let Some(output_dir) = args.get(2) else {
-            return Ok(None);
-        };
-        let dpi = match args.get(3) {
-            Some(value) => value
-                .parse::<f32>()
-                .map_err(|error| format!("invalid dpi '{value}': {error}"))?,
-            None => DEFAULT_DPI,
-        };
+impl NativeCli {
+    /// Parses command-line arguments using clap's enum-based subcommand model.
+    fn from_env() -> Self {
+        Self::parse()
+    }
 
-        Ok(Some(Self {
-            input_pdf: PathBuf::from(input_pdf),
-            output_dir: PathBuf::from(output_dir),
-            dpi,
-        }))
+    /// Dispatches the parsed native command.
+    fn run(self) -> Result<(), String> {
+        self.command.run()
     }
 }
 
-/// Run the native PDF layout detection CLI.
-pub fn run_cli() -> Result<(), String> {
-    let args = std::env::args().collect::<Vec<_>>();
-    let Some(cli_args) = NativeCliArgs::from_args(&args)? else {
-        print_usage(&args[0]);
-        return Ok(());
-    };
-
-    detect_pdf_to_dir(&cli_args.input_pdf, &cli_args.output_dir, cli_args.dpi)
+impl NativeCommand {
+    /// Runs the selected native CLI command.
+    fn run(self) -> Result<(), String> {
+        match self {
+            Self::Detect(args) => args.run(),
+        }
+    }
 }
 
-/// Detect every page in a PDF, write annotated outputs, and emit per-stage timing events.
-pub fn detect_pdf_to_dir(input_pdf: &Path, output_dir: &Path, dpi: f32) -> Result<(), String> {
+impl DetectArgs {
+    /// Runs PDF detection using the parsed detect command options.
+    fn run(self) -> Result<(), String> {
+        detect_pdf_to_dir(&self.input_pdf, &self.output_dir, self.dpi)
+    }
+}
+
+/// Runs the native CLI process and exits with status 1 on pipeline errors.
+pub fn run() {
+    init_tracing();
+    if let Err(error) = NativeCli::from_env().run() {
+        tracing::error!("{error}");
+        std::process::exit(1);
+    }
+}
+
+/// Detects every page in a PDF, writes annotated outputs, and emits per-stage timing events.
+fn detect_pdf_to_dir(input_pdf: &Path, output_dir: &Path, dpi: f32) -> Result<(), String> {
     let total_started = Instant::now();
 
     let create_output_started = Instant::now();
@@ -232,17 +249,7 @@ pub fn detect_pdf_to_dir(input_pdf: &Path, output_dir: &Path, dpi: f32) -> Resul
     Ok(())
 }
 
-/// Print the CLI usage as a tracing event so logging remains structured.
-fn print_usage(bin: &str) {
-    tracing::event!(
-        Level::INFO,
-        usage = %format!("{bin} <input.pdf> <output-dir> [dpi]"),
-        example = %format!("cargo run --no-default-features --features backend-ndarray,native-cli -- file.pdf out 96"),
-        "native CLI usage"
-    );
-}
-
-/// Encode an RGBA page buffer as PNG bytes.
+/// Encodes an RGBA page buffer as PNG bytes.
 fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, png::EncodingError> {
     let mut png_bytes = Vec::new();
     {
@@ -255,9 +262,20 @@ fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, png:
     Ok(png_bytes)
 }
 
-/// Build a stable output file path for one-based page numbers.
+/// Builds a stable output file path for one-based page numbers.
 fn output_path_for_page(output_dir: &Path, page_number: u32, extension: &str) -> PathBuf {
     output_dir.join(format!("page-{page_number:04}.{extension}"))
+}
+
+/// Initializes stderr tracing for native binaries using `RUST_LOG` when present.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 #[derive(Serialize)]
@@ -277,30 +295,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_cli_args_use_96_dpi_when_dpi_is_omitted() {
-        let args = vec![
-            "doclayout-detector".to_string(),
-            "input.pdf".to_string(),
-            "out".to_string(),
-        ];
+    fn native_cli_detect_uses_default_output_dir_and_dpi() {
+        let parsed =
+            NativeCli::try_parse_from(["doclayout-detector", "detect", "input.pdf"]).unwrap();
 
-        let parsed = NativeCliArgs::from_args(&args).unwrap().unwrap();
+        let NativeCommand::Detect(args) = parsed.command;
 
-        assert_eq!(parsed.dpi, 96.0);
+        assert_eq!(args.output_dir, Path::new("output"));
+        assert_eq!(args.dpi, 96.0);
     }
 
     #[test]
-    fn native_cli_args_use_explicit_dpi_when_present() {
-        let args = vec![
-            "doclayout-detector".to_string(),
-            "input.pdf".to_string(),
-            "out".to_string(),
-            "150".to_string(),
-        ];
+    fn native_cli_detect_accepts_explicit_output_dir_and_dpi() {
+        let parsed = NativeCli::try_parse_from([
+            "doclayout-detector",
+            "detect",
+            "input.pdf",
+            "--output-dir",
+            "out",
+            "--dpi",
+            "150",
+        ])
+        .unwrap();
 
-        let parsed = NativeCliArgs::from_args(&args).unwrap().unwrap();
+        let NativeCommand::Detect(args) = parsed.command;
 
-        assert_eq!(parsed.dpi, 150.0);
+        assert_eq!(args.output_dir, Path::new("out"));
+        assert_eq!(args.dpi, 150.0);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::pp_doclayout::PPDocLayoutV3Label;
 pub struct AnnotatedDetection {
     pub label: PPDocLayoutV3Label,
     pub confidence: f32,
+    pub order: usize,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -18,6 +19,7 @@ impl From<&crate::pp_doclayout::PPDocLayoutV3Detection> for AnnotatedDetection {
         Self {
             label: value.label,
             confidence: value.confidence,
+            order: value.order,
             x: value.x,
             y: value.y,
             width: value.width,
