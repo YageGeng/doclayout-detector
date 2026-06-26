@@ -17,6 +17,7 @@ pub struct HgNetV2Stem<B: Backend> {
 }
 
 impl<B: Backend> HgNetV2Stem<B> {
+    /// Loads the HGNetV2 stem layers that downsample RGB input into early feature maps.
     pub fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -85,6 +86,7 @@ impl<B: Backend> HgNetV2Stem<B> {
         })
     }
 
+    /// Runs the stem split-branch pooling path and returns the first backbone embedding.
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let embedding = self
             .stem1
@@ -109,6 +111,7 @@ pub struct HgNetV2Backbone<B: Backend> {
 }
 
 impl<B: Backend> HgNetV2Backbone<B> {
+    /// Loads the full HGNetV2 backbone stages used by PP-DocLayoutV3.
     pub fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -181,6 +184,7 @@ impl<B: Backend> HgNetV2Backbone<B> {
         Ok(Self { stem, stages })
     }
 
+    /// Runs the backbone and returns the four stage feature maps used by the encoder.
     pub fn forward(&self, input: Tensor<B, 4>) -> Vec<Tensor<B, 4>> {
         let mut hidden = self.stem.forward(input);
         let mut features = Vec::with_capacity(self.stages.len());
@@ -211,6 +215,7 @@ struct HgNetV2Stage<B: Backend> {
 }
 
 impl<B: Backend> HgNetV2Stage<B> {
+    /// Loads one HGNetV2 stage, including optional depthwise downsampling.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -257,6 +262,7 @@ impl<B: Backend> HgNetV2Stage<B> {
         Ok(Self { downsample, blocks })
     }
 
+    /// Runs optional downsampling followed by all HGNetV2 blocks in this stage.
     fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let mut hidden = match &self.downsample {
             Some(downsample) => downsample.forward(input),
@@ -279,6 +285,7 @@ struct HgNetV2Block<B: Backend> {
 
 impl<B: Backend> HgNetV2Block<B> {
     #[allow(clippy::too_many_arguments)]
+    /// Loads a dense HGNetV2 block with aggregation layers and optional residual output.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -352,6 +359,7 @@ impl<B: Backend> HgNetV2Block<B> {
         })
     }
 
+    /// Runs all internal layers, concatenates intermediate states, and aggregates channels.
     fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let identity = input.clone();
         let mut hidden = input;
@@ -381,6 +389,7 @@ enum HgNetV2Layer<B: Backend> {
 }
 
 impl<B: Backend> HgNetV2Layer<B> {
+    /// Loads a regular HGNetV2 convolutional layer.
     fn load_regular(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -402,6 +411,7 @@ impl<B: Backend> HgNetV2Layer<B> {
         )?)))
     }
 
+    /// Loads a lightweight HGNetV2 layer with pointwise and depthwise convolutions.
     fn load_light(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -436,6 +446,7 @@ impl<B: Backend> HgNetV2Layer<B> {
         })
     }
 
+    /// Runs either the regular layer or the two-step lightweight layer.
     fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         match self {
             Self::Regular(layer) => layer.forward(input),

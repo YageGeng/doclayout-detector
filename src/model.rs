@@ -4,6 +4,8 @@ use crate::pp_doclayout::{
     PPDocLayoutV3OwnedOutputs, PPDocLayoutV3Weights,
 };
 use burn::tensor::{Tensor, TensorData};
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+use tracing::Level;
 
 #[cfg(not(any(
     feature = "backend-ndarray",
@@ -82,6 +84,7 @@ pub struct EmbeddedModel {
 
 impl EmbeddedModel {
     #[cfg(not(all(target_family = "wasm", feature = "backend-webgpu")))]
+    /// Initializes the compiled native backend and loads the embedded layout model.
     pub fn new() -> Result<Self, LayoutError> {
         let device = create_device();
         tracing::info!(backend = BACKEND_NAME, "initialized layout backend");
@@ -90,6 +93,7 @@ impl EmbeddedModel {
     }
 
     #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+    /// Initializes the browser WebGPU backend asynchronously and loads the embedded layout model.
     pub async fn new_async() -> Result<Self, LayoutError> {
         let device = create_device_async().await;
         tracing::info!(backend = BACKEND_NAME, "initialized layout backend");
@@ -99,6 +103,7 @@ impl EmbeddedModel {
 }
 
 impl PPDocLayoutV3Inference for EmbeddedModel {
+    /// Runs synchronous model inference and copies tensor outputs back to owned host buffers.
     fn infer(&self, input: &[f32]) -> Result<PPDocLayoutV3OwnedOutputs, LayoutError> {
         let expected =
             3 * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize;
@@ -157,6 +162,7 @@ impl PPDocLayoutV3Inference for EmbeddedModel {
 
 #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
 impl EmbeddedModel {
+    /// Runs browser WebGPU inference with async tensor readbacks for postprocessing.
     pub async fn infer_async(
         &self,
         input: &[f32],
@@ -170,6 +176,7 @@ impl EmbeddedModel {
             )));
         }
 
+        let upload_profile = EmbeddedWasmTimer::start("input_upload");
         let tensor = Tensor::<LayoutBackend, 4>::from_data(
             TensorData::new(
                 input.to_vec(),
@@ -182,10 +189,16 @@ impl EmbeddedModel {
             ),
             &self.device,
         );
+        upload_profile.finish();
+
+        let forward_profile = EmbeddedWasmTimer::start("model_forward_async");
         let output = self.model.forward_async(tensor).await?;
+        forward_profile.finish();
         let logits_shape = output.logits.dims();
         let pred_boxes_shape = output.pred_boxes.dims();
         let order_logits_shape = output.order_logits.as_ref().map(|tensor| tensor.dims());
+
+        let logits_profile = EmbeddedWasmTimer::start("logits_readback");
         let logits = output
             .logits
             .into_data_async()
@@ -197,6 +210,9 @@ impl EmbeddedModel {
             .map_err(|error| {
                 LayoutError::InvalidModelOutput(format!("decode logits tensor: {error}"))
             })?;
+        logits_profile.finish();
+
+        let boxes_profile = EmbeddedWasmTimer::start("pred_boxes_readback");
         let pred_boxes = output
             .pred_boxes
             .into_data_async()
@@ -208,9 +224,12 @@ impl EmbeddedModel {
             .map_err(|error| {
                 LayoutError::InvalidModelOutput(format!("decode pred boxes tensor: {error}"))
             })?;
+        boxes_profile.finish();
+
         let order_logits = match output.order_logits {
-            Some(tensor) => Some(
-                tensor
+            Some(tensor) => {
+                let order_profile = EmbeddedWasmTimer::start("order_logits_readback");
+                let values = tensor
                     .into_data_async()
                     .await
                     .map_err(|error| {
@@ -223,8 +242,10 @@ impl EmbeddedModel {
                         LayoutError::InvalidModelOutput(format!(
                             "decode order logits tensor: {error}"
                         ))
-                    })?,
-            ),
+                    })?;
+                order_profile.finish();
+                Some(values)
+            }
             None => None,
         };
 
@@ -239,6 +260,35 @@ impl EmbeddedModel {
     }
 }
 
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[derive(Debug, Clone)]
+struct EmbeddedWasmTimer {
+    step: &'static str,
+    started_ms: f64,
+}
+
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+impl EmbeddedWasmTimer {
+    /// Start a browser-compatible timer for embedded model IO steps.
+    fn start(step: &'static str) -> Self {
+        Self {
+            step,
+            started_ms: js_sys::Date::now(),
+        }
+    }
+
+    /// Emit a tracing event with elapsed milliseconds for this model IO step.
+    fn finish(self) {
+        tracing::event!(
+            Level::INFO,
+            step = self.step,
+            duration_ms = js_sys::Date::now() - self.started_ms,
+            "embedded model step completed"
+        );
+    }
+}
+
+/// Loads the embedded PP-DocLayoutV3 safetensors weights into the selected backend.
 fn load_model(device: &LayoutDevice) -> Result<PPDocLayoutV3Model<LayoutBackend>, LayoutError> {
     let weights = PPDocLayoutV3Weights::from_bytes(
         include_bytes!("../models/pp_doclayout_v3/model.safetensors").to_vec(),
@@ -254,6 +304,7 @@ fn load_model(device: &LayoutDevice) -> Result<PPDocLayoutV3Model<LayoutBackend>
         feature = "backend-webgpu"
     ))
 ))]
+/// Creates a CPU ndarray device for deterministic native execution.
 fn create_device() -> LayoutDevice {
     burn_ndarray::NdArrayDevice::Cpu
 }
@@ -262,6 +313,7 @@ fn create_device() -> LayoutDevice {
     feature = "backend-metal",
     not(any(feature = "backend-vulkan", feature = "backend-webgpu"))
 ))]
+/// Creates and initializes a native Metal-backed WGPU device.
 fn create_device() -> LayoutDevice {
     let device = burn_wgpu::WgpuDevice::DefaultDevice;
     burn_wgpu::init_setup::<burn_wgpu::graphics::Metal>(&device, Default::default());
@@ -269,6 +321,7 @@ fn create_device() -> LayoutDevice {
 }
 
 #[cfg(all(feature = "backend-vulkan", not(feature = "backend-webgpu")))]
+/// Creates and initializes a native Vulkan-backed WGPU device.
 fn create_device() -> LayoutDevice {
     let device = burn_wgpu::WgpuDevice::DefaultDevice;
     burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(&device, Default::default());
@@ -276,6 +329,7 @@ fn create_device() -> LayoutDevice {
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "backend-webgpu"))]
+/// Creates and initializes a native WebGPU-backed WGPU device.
 fn create_device() -> LayoutDevice {
     let device = burn_wgpu::WgpuDevice::DefaultDevice;
     burn_wgpu::init_setup::<burn_wgpu::graphics::WebGpu>(&device, Default::default());
@@ -283,6 +337,7 @@ fn create_device() -> LayoutDevice {
 }
 
 #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+/// Creates and initializes a browser WebGPU device using Burn's async setup path.
 async fn create_device_async() -> LayoutDevice {
     let device = burn_wgpu::WgpuDevice::DefaultDevice;
     burn_wgpu::init_setup_async::<burn_wgpu::graphics::WebGpu>(&device, Default::default()).await;

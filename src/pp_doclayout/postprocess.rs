@@ -5,6 +5,7 @@ use crate::types::PageImage;
 
 const NUM_QUERIES: usize = 300;
 
+/// Decodes raw PP-DocLayoutV3 tensors into page-space detections sorted by reading order.
 pub fn decode_box_detections(
     outputs: &PPDocLayoutV3RawOutputs<'_>,
     image: &PageImage<'_>,
@@ -98,6 +99,7 @@ pub fn decode_box_detections(
     Ok(detections)
 }
 
+/// Verifies that model output tensors match the checkpoint's fixed query and class shapes.
 fn validate_shapes(outputs: &PPDocLayoutV3RawOutputs<'_>) -> Result<(), LayoutError> {
     let class_count = PPDocLayoutV3Label::class_count();
     if outputs.logits_shape != [1, NUM_QUERIES, class_count] {
@@ -140,6 +142,7 @@ fn validate_shapes(outputs: &PPDocLayoutV3RawOutputs<'_>) -> Result<(), LayoutEr
     }
 }
 
+/// Converts pairwise order logits into a stable per-query ordering rank.
 fn compute_order_sequence(order_logits: &[f32]) -> Vec<usize> {
     let mut order_votes = vec![0.0; NUM_QUERIES];
     for col in 0..NUM_QUERIES {
@@ -163,6 +166,7 @@ fn compute_order_sequence(order_logits: &[f32]) -> Vec<usize> {
     order_seq
 }
 
+/// Applies the scalar sigmoid used for class scores and order logits.
 fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }

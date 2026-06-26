@@ -55,6 +55,10 @@
         width: 76px;
       }
 
+      #page {
+        width: 68px;
+      }
+
       button {
         min-height: 34px;
         padding: 0 12px;
@@ -69,6 +73,11 @@
       button:disabled {
         cursor: not-allowed;
         opacity: 0.45;
+      }
+
+      button.secondary {
+        background: #ffffff;
+        color: #1d1d1b;
       }
 
       main {
@@ -183,8 +192,12 @@
       <h1>PP-DocLayoutV3 PDF Preview</h1>
       <div class="controls">
         <input id="file" type="file" accept="application/pdf,.pdf" />
-        <label>DPI <input id="dpi" type="number" min="72" max="220" step="6" value="144" /></label>
+        <label>DPI <input id="dpi" type="number" min="72" max="220" step="6" value="96" /></label>
+        <button id="prev" class="secondary" disabled>Prev</button>
+        <label>Page <input id="page" type="number" min="1" value="1" disabled /></label>
+        <button id="next" class="secondary" disabled>Next</button>
         <button id="run" disabled>Detect</button>
+        <button id="run-all" class="secondary" disabled>Detect All</button>
       </div>
     </header>
 
@@ -227,17 +240,67 @@
 
       const fileInput = document.querySelector("#file");
       const dpiInput = document.querySelector("#dpi");
+      const pageInput = document.querySelector("#page");
+      const prevButton = document.querySelector("#prev");
+      const nextButton = document.querySelector("#next");
       const runButton = document.querySelector("#run");
+      const runAllButton = document.querySelector("#run-all");
       const status = document.querySelector("#status");
       const pages = document.querySelector("#pages");
 
       let detector = null;
       let pdfBytes = null;
+      let pageCount = 0;
+      const pageCache = new Map();
 
+      // Update the compact status line without using console output.
       function setStatus(message) {
         status.textContent = message;
       }
 
+      // Keep controls disabled while detection is running or inputs are absent.
+      function setBusy(isBusy) {
+        const ready = Boolean(detector && pdfBytes && pageCount > 0);
+        fileInput.disabled = isBusy;
+        dpiInput.disabled = isBusy;
+        pageInput.disabled = isBusy || !ready;
+        prevButton.disabled = isBusy || !ready || currentPageNumber() <= 1;
+        nextButton.disabled = isBusy || !ready || currentPageNumber() >= pageCount;
+        runButton.disabled = isBusy || !ready;
+        runAllButton.disabled = isBusy || !ready;
+      }
+
+      // Read and clamp the selected one-based page number.
+      function currentPageNumber() {
+        const rawPage = Number(pageInput.value || 1);
+        if (!Number.isFinite(rawPage)) return 1;
+        return Math.min(Math.max(Math.trunc(rawPage), 1), Math.max(pageCount, 1));
+      }
+
+      // Build a cache key that accounts for DPI because it changes render size.
+      function pageCacheKey(pageNumber, dpi) {
+        return `${pageNumber}:${dpi}`;
+      }
+
+      // Configure page controls after a new PDF is available.
+      function setPageCount(count) {
+        pageCount = count;
+        pageInput.max = String(Math.max(count, 1));
+        pageInput.value = "1";
+        setBusy(false);
+      }
+
+      // Render a cached result immediately when the selected page was already detected.
+      function showCachedPage(pageNumber, dpi) {
+        const cached = pageCache.get(pageCacheKey(pageNumber, dpi));
+        if (!cached) return false;
+        pages.replaceChildren();
+        appendPage(cached);
+        setStatus(`Showing cached page ${pageNumber} of ${pageCount}.`);
+        return true;
+      }
+
+      // Load the wasm module and attach cached PDF data if the user selected a file early.
       async function boot() {
         if (!("gpu" in navigator)) {
           setStatus("WebGPU is not available in this browser.");
@@ -247,53 +310,108 @@
         setStatus("Loading wasm module...");
         await init();
         detector = new PPDocLayoutWasm();
-        runButton.disabled = !pdfBytes;
-        setStatus("Choose a PDF to detect layout boxes.");
+        if (pdfBytes) {
+          setPageCount(detector.loadPdf(pdfBytes));
+          setStatus(`${pageCount} pages loaded.`);
+        } else {
+          setBusy(false);
+          setStatus("Choose a PDF to detect layout boxes.");
+        }
       }
 
       fileInput.addEventListener("change", async () => {
         const file = fileInput.files?.[0];
         pages.replaceChildren();
+        pageCache.clear();
         if (!file) {
           pdfBytes = null;
-          runButton.disabled = true;
+          pageCount = 0;
+          setBusy(false);
           setStatus("Choose a PDF to detect layout boxes.");
           return;
         }
 
         pdfBytes = new Uint8Array(await file.arrayBuffer());
         const count = detector ? detector.loadPdf(pdfBytes) : 0;
-        runButton.disabled = !detector;
+        setPageCount(count);
         setStatus(detector ? `${file.name} loaded · ${count} pages.` : `${file.name} loaded.`);
       });
 
-      runButton.addEventListener("click", async () => {
+      pageInput.addEventListener("change", () => {
+        const pageNumber = currentPageNumber();
+        pageInput.value = String(pageNumber);
+        setBusy(false);
+        showCachedPage(pageNumber, Number(dpiInput.value || 96));
+      });
+
+      prevButton.addEventListener("click", () => {
+        pageInput.value = String(Math.max(currentPageNumber() - 1, 1));
+        pageInput.dispatchEvent(new Event("change"));
+      });
+
+      nextButton.addEventListener("click", () => {
+        pageInput.value = String(Math.min(currentPageNumber() + 1, pageCount));
+        pageInput.dispatchEvent(new Event("change"));
+      });
+
+      runButton.addEventListener("click", detectCurrentPage);
+      runAllButton.addEventListener("click", detectAllPages);
+
+      // Detect only the selected page so large documents stay interactive by default.
+      async function detectCurrentPage() {
         if (!detector || !pdfBytes) return;
 
-        runButton.disabled = true;
-        pages.replaceChildren();
+        const dpi = Number(dpiInput.value || 96);
+        const pageNumber = currentPageNumber();
+        if (showCachedPage(pageNumber, dpi)) return;
+        setBusy(true);
 
         try {
-          const dpi = Number(dpiInput.value || 144);
-          const count = detector.loadedPageCount() || detector.loadPdf(pdfBytes);
-          const startedAt = performance.now();
-          for (let pageNumber = 1; pageNumber <= count; pageNumber += 1) {
-            setStatus(`Detecting page ${pageNumber} of ${count}...`);
-            const pageStartedAt = performance.now();
-            const page = await detector.detectLoadedPage(pageNumber, dpi);
-            appendPage(page);
-            const pageMs = Math.round(performance.now() - pageStartedAt);
-            setStatus(`Detected page ${pageNumber} of ${count} in ${pageMs} ms.`);
-          }
-          const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
-          setStatus(`Finished ${count} page${count === 1 ? "" : "s"} in ${elapsedSeconds}s.`);
+          pages.replaceChildren();
+          setStatus(`Detecting page ${pageNumber} of ${pageCount}...`);
+          const pageStartedAt = performance.now();
+          const page = await detector.detectLoadedPage(pageNumber, dpi);
+          pageCache.set(pageCacheKey(pageNumber, dpi), page);
+          appendPage(page);
+          const pageMs = Math.round(performance.now() - pageStartedAt);
+          setStatus(`Detected page ${pageNumber} of ${pageCount} in ${pageMs} ms.`);
         } catch (error) {
           setStatus(error instanceof Error ? error.message : String(error));
         } finally {
-          runButton.disabled = false;
+          setBusy(false);
         }
-      });
+      }
 
+      // Detect every page only when explicitly requested.
+      async function detectAllPages() {
+        if (!detector || !pdfBytes) return;
+
+        setBusy(true);
+        pages.replaceChildren();
+
+        try {
+          const dpi = Number(dpiInput.value || 96);
+          const startedAt = performance.now();
+          for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+            pageInput.value = String(pageNumber);
+            setStatus(`Detecting page ${pageNumber} of ${pageCount}...`);
+            const pageStartedAt = performance.now();
+            const page = await detector.detectLoadedPage(pageNumber, dpi);
+            pageCache.set(pageCacheKey(pageNumber, dpi), page);
+            appendPage(page);
+            const pageMs = Math.round(performance.now() - pageStartedAt);
+            setStatus(`Detected page ${pageNumber} of ${pageCount} in ${pageMs} ms.`);
+          }
+          const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+          setStatus(`Finished ${pageCount} pages in ${elapsedSeconds}s.`);
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : String(error));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      // Append one annotated page result to the output list.
       function appendPage(page) {
         const section = document.createElement("section");
         section.className = "page";

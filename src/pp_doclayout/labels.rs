@@ -60,10 +60,12 @@ pub enum PPDocLayoutV3Label {
 }
 
 impl PPDocLayoutV3Label {
+    /// Returns the number of class labels emitted by the PP-DocLayoutV3 checkpoint.
     pub const fn class_count() -> usize {
         PP_DOCLAYOUT_V3_LABELS.len()
     }
 
+    /// Returns the official snake_case label name used for serialization.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Abstract => "abstract",
@@ -94,6 +96,7 @@ impl PPDocLayoutV3Label {
         }
     }
 
+    /// Returns a deterministic RGBA color used for debug page annotations.
     pub fn debug_color_rgba(self) -> [u8; 4] {
         match self {
             Self::Abstract => [0x7C, 0x4D, 0xFF, 255],
@@ -128,6 +131,7 @@ impl PPDocLayoutV3Label {
 impl TryFrom<usize> for PPDocLayoutV3Label {
     type Error = PPDocLayoutV3LabelError;
 
+    /// Converts a zero-based class id into its PP-DocLayoutV3 label.
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         PP_DOCLAYOUT_V3_LABELS
             .get(value)
@@ -139,6 +143,7 @@ impl TryFrom<usize> for PPDocLayoutV3Label {
 impl FromStr for PPDocLayoutV3Label {
     type Err = PPDocLayoutV3LabelError;
 
+    /// Parses an official snake_case label name.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         PP_DOCLAYOUT_V3_LABELS
             .iter()
@@ -149,6 +154,7 @@ impl FromStr for PPDocLayoutV3Label {
 }
 
 impl std::fmt::Display for PPDocLayoutV3Label {
+    /// Formats a label as its official snake_case name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }

@@ -20,7 +20,6 @@ pub fn validate_page_image(image: &PageImage<'_>) -> Result<(), LayoutError> {
 mod tests {
     use super::*;
 
-    // Verifies that tightly packed RGB buffers pass validation.
     #[test]
     fn validates_rgb_buffer_length() {
         let image = PageImage {

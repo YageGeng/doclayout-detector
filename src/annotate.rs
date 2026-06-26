@@ -13,6 +13,7 @@ pub struct AnnotatedDetection {
 }
 
 impl From<&crate::pp_doclayout::PPDocLayoutV3Detection> for AnnotatedDetection {
+    /// Converts model-space detection output into the serializable annotation shape.
     fn from(value: &crate::pp_doclayout::PPDocLayoutV3Detection) -> Self {
         Self {
             label: value.label,
@@ -84,6 +85,7 @@ struct Rect {
     bottom: i32,
 }
 
+/// Draws a clipped two-pixel rectangle outline into the supplied RGBA canvas.
 fn draw_rect_outline(canvas: Canvas<'_>, rect: Rect, color: [u8; 4]) {
     let Canvas {
         rgba,
@@ -145,6 +147,7 @@ fn draw_rect_outline(canvas: Canvas<'_>, rect: Rect, color: [u8; 4]) {
     }
 }
 
+/// Draws a clipped horizontal RGBA line segment.
 fn draw_horizontal_line(
     rgba: &mut [u8],
     image_width: i32,
@@ -163,6 +166,7 @@ fn draw_horizontal_line(
     }
 }
 
+/// Draws a clipped vertical RGBA line segment.
 fn draw_vertical_line(
     rgba: &mut [u8],
     image_width: i32,
@@ -181,6 +185,7 @@ fn draw_vertical_line(
     }
 }
 
+/// Writes one RGBA pixel into a tightly packed canvas buffer.
 fn put_pixel(rgba: &mut [u8], image_width: i32, x: i32, y: i32, color: [u8; 4]) {
     let offset = ((y * image_width + x) * 4) as usize;
     rgba[offset..offset + 4].copy_from_slice(&color);

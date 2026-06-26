@@ -16,6 +16,7 @@ pub struct PPDocLayoutV3EncoderInputProjection<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3EncoderInputProjection<B> {
+    /// Loads the 1x1 projections that normalize backbone feature channels to the encoder width.
     pub fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -40,6 +41,7 @@ impl<B: Backend> PPDocLayoutV3EncoderInputProjection<B> {
         Ok(Self { projections })
     }
 
+    /// Projects selected backbone feature maps into the 256-channel encoder space.
     pub fn forward(&self, inputs: Vec<Tensor<B, 4>>) -> Vec<Tensor<B, 4>> {
         self.projections
             .iter()
@@ -68,6 +70,7 @@ pub struct PPDocLayoutV3HybridEncoder<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3HybridEncoder<B> {
+    /// Loads the hybrid encoder, FPN/PAN fusion blocks, and mask feature head.
     pub fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -163,6 +166,7 @@ impl<B: Backend> PPDocLayoutV3HybridEncoder<B> {
         })
     }
 
+    /// Runs AIFI attention, top-down FPN fusion, bottom-up PAN fusion, and mask feature decoding.
     pub fn forward(
         &self,
         mut feature_maps: Vec<Tensor<B, 4>>,
@@ -210,6 +214,7 @@ struct PPDocLayoutV3AifiLayer<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3AifiLayer<B> {
+    /// Loads the single AIFI transformer layer used on the lowest-resolution feature map.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -220,6 +225,7 @@ impl<B: Backend> PPDocLayoutV3AifiLayer<B> {
         })
     }
 
+    /// Applies positional self-attention over flattened spatial tokens and restores BCHW layout.
     fn forward(&self, hidden_states: Tensor<B, 4>) -> Tensor<B, 4> {
         let [batch_size, channels, height, width] = hidden_states.dims();
         let hidden_states = hidden_states.flatten(2, 3).swap_dims(1, 2);
@@ -244,6 +250,7 @@ struct PPDocLayoutV3EncoderLayer<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3EncoderLayer<B> {
+    /// Loads one transformer encoder layer with self-attention and feed-forward weights.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -272,6 +279,7 @@ impl<B: Backend> PPDocLayoutV3EncoderLayer<B> {
         })
     }
 
+    /// Runs residual self-attention followed by a residual feed-forward block.
     fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
@@ -295,6 +303,7 @@ struct PPDocLayoutV3SelfAttention<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3SelfAttention<B> {
+    /// Loads query, key, value, and output projections for multi-head self-attention.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -315,6 +324,7 @@ impl<B: Backend> PPDocLayoutV3SelfAttention<B> {
         })
     }
 
+    /// Computes scaled dot-product attention over flattened encoder tokens.
     fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
@@ -357,6 +367,7 @@ struct PPDocLayoutV3CspRepLayer<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3CspRepLayer<B> {
+    /// Loads a CSP Rep layer used by both FPN and PAN feature fusion.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -407,6 +418,7 @@ impl<B: Backend> PPDocLayoutV3CspRepLayer<B> {
         })
     }
 
+    /// Runs the bottleneck branch and adds it to the shortcut projection branch.
     fn forward(&self, hidden_state: Tensor<B, 4>) -> Tensor<B, 4> {
         let mut hidden_state_1 = self.conv1.forward(hidden_state.clone());
         for block in &self.bottlenecks {
@@ -424,6 +436,7 @@ struct PPDocLayoutV3RepVggBlock<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3RepVggBlock<B> {
+    /// Loads the two-branch RepVGG block used inside CSP fusion layers.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -457,6 +470,7 @@ impl<B: Backend> PPDocLayoutV3RepVggBlock<B> {
         })
     }
 
+    /// Adds the 3x3 and 1x1 convolution branches and applies SiLU activation.
     fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         silu(self.conv1.forward(input.clone()) + self.conv2.forward(input))
     }
@@ -469,6 +483,7 @@ struct PPDocLayoutV3MaskFeatFpn<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3MaskFeatFpn<B> {
+    /// Loads the multi-scale mask feature FPN heads and output convolution.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -512,6 +527,7 @@ impl<B: Backend> PPDocLayoutV3MaskFeatFpn<B> {
         })
     }
 
+    /// Aligns all PAN features to the highest mask resolution and sums them.
     fn forward(&self, inputs: &[Tensor<B, 4>]) -> Tensor<B, 4> {
         let mut output = self.scale_heads[0].forward(inputs[0].clone());
         let [_, _, height, width] = output.dims();
@@ -535,6 +551,7 @@ struct PPDocLayoutV3ScaleHead<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3ScaleHead<B> {
+    /// Loads one scale head and records how many 2x upsample steps it needs.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -575,6 +592,7 @@ impl<B: Backend> PPDocLayoutV3ScaleHead<B> {
         })
     }
 
+    /// Applies the scale head convolutions and requested bilinear upsampling steps.
     fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let mut output = self.conv0.forward(input);
         if self.upsample_count >= 2 {
@@ -595,6 +613,7 @@ struct PPDocLayoutV3EncoderMaskOutput<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3EncoderMaskOutput<B> {
+    /// Loads the final mask feature projection from 64 channels to 32 channels.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -625,11 +644,13 @@ impl<B: Backend> PPDocLayoutV3EncoderMaskOutput<B> {
         })
     }
 
+    /// Produces the encoder mask feature map consumed by decoder mask queries.
     fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         self.conv.forward(self.base_conv.forward(input))
     }
 }
 
+/// Upsamples a BCHW tensor by 2x using nearest-neighbor interpolation.
 fn upsample_nearest_2x<B: Backend>(input: Tensor<B, 4>) -> Tensor<B, 4> {
     let [_, _, height, width] = input.dims();
     interpolate(
@@ -639,6 +660,7 @@ fn upsample_nearest_2x<B: Backend>(input: Tensor<B, 4>) -> Tensor<B, 4> {
     )
 }
 
+/// Upsamples a BCHW tensor by 2x using bilinear interpolation without aligned corners.
 fn upsample_bilinear_2x<B: Backend>(input: Tensor<B, 4>) -> Tensor<B, 4> {
     let [_, _, height, width] = input.dims();
     interpolate(
@@ -648,6 +670,7 @@ fn upsample_bilinear_2x<B: Backend>(input: Tensor<B, 4>) -> Tensor<B, 4> {
     )
 }
 
+/// Builds sine/cosine 2D positional embeddings for flattened encoder tokens.
 fn position_embeddings<B: Backend>(
     height: usize,
     width: usize,

@@ -16,23 +16,27 @@ pub struct PPDocLayoutV3Weights {
 }
 
 impl PPDocLayoutV3Weights {
+    /// Reads safetensors bytes from disk and validates the model container.
     pub fn from_file(path: &Path) -> Result<Self, LayoutError> {
         let bytes = std::fs::read(path)
             .map_err(|error| LayoutError::InvalidModelOutput(format!("read weights: {error}")))?;
         Self::from_bytes(bytes)
     }
 
+    /// Creates a weight store from in-memory safetensors bytes after validation.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, LayoutError> {
         let weights = Self { bytes };
         weights.validate()?;
         Ok(weights)
     }
 
+    /// Returns all tensor names stored in the safetensors model file.
     pub fn names(&self) -> Result<Vec<String>, LayoutError> {
         let tensors = self.tensors()?;
         Ok(tensors.names().into_iter().map(str::to_string).collect())
     }
 
+    /// Returns shape metadata for one named tensor without materializing it.
     pub fn info(&self, name: &str) -> Result<WeightInfo, LayoutError> {
         let tensors = self.tensors()?;
         let tensor = tensors.tensor(name).map_err(|error| {
@@ -44,6 +48,7 @@ impl PPDocLayoutV3Weights {
         })
     }
 
+    /// Loads one F32 tensor with the expected rank onto the target backend device.
     pub fn tensor_f32<B: Backend, const D: usize>(
         &self,
         name: &str,
@@ -76,10 +81,12 @@ impl PPDocLayoutV3Weights {
         ))
     }
 
+    /// Validates that the safetensors payload can be deserialized.
     fn validate(&self) -> Result<(), LayoutError> {
         self.tensors().map(|_| ())
     }
 
+    /// Deserializes the borrowed safetensors view used by all weight accessors.
     fn tensors(&self) -> Result<SafeTensors<'_>, LayoutError> {
         SafeTensors::deserialize(&self.bytes).map_err(|error| {
             LayoutError::InvalidModelOutput(format!("deserialize safetensors: {error}"))

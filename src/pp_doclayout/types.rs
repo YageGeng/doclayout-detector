@@ -32,6 +32,7 @@ pub struct PPDocLayoutV3OwnedOutputs {
 }
 
 impl PPDocLayoutV3OwnedOutputs {
+    /// Borrows owned model outputs as raw slices for postprocessing.
     pub fn as_raw_outputs(&self) -> PPDocLayoutV3RawOutputs<'_> {
         PPDocLayoutV3RawOutputs {
             logits_shape: self.logits_shape,
@@ -45,6 +46,7 @@ impl PPDocLayoutV3OwnedOutputs {
 }
 
 impl From<PPDocLayoutV3Detection> for crate::types::LayoutDetection {
+    /// Converts PP-DocLayout detections into the crate-level layout detection type.
     fn from(value: PPDocLayoutV3Detection) -> Self {
         Self {
             label: value.label,

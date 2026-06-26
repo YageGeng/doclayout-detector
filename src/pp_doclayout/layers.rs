@@ -15,6 +15,7 @@ pub enum Activation {
 }
 
 impl Activation {
+    /// Applies the configured activation without changing tensor rank or layout.
     fn forward<B: Backend, const D: usize>(self, input: Tensor<B, D>) -> Tensor<B, D> {
         match self {
             Self::None => input,
@@ -40,6 +41,7 @@ pub struct ConvNormAct<B: Backend> {
 
 impl<B: Backend> ConvNormAct<B> {
     #[allow(clippy::too_many_arguments)]
+    /// Loads a convolution, batch normalization, and activation block with explicit submodule names.
     pub fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -86,6 +88,7 @@ impl<B: Backend> ConvNormAct<B> {
         })
     }
 
+    /// Runs convolution, batch normalization, and activation for a BCHW feature map.
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let output = self.conv.forward(input);
         let output = self.norm.forward(output);
@@ -95,6 +98,7 @@ impl<B: Backend> ConvNormAct<B> {
 
 impl<B: Backend> ConvBnAct<B> {
     #[allow(clippy::too_many_arguments)]
+    /// Loads a convolution-batchnorm-activation block using default same-padding.
     pub fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -121,6 +125,7 @@ impl<B: Backend> ConvBnAct<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Loads a convolution-batchnorm-activation block with caller-supplied padding.
     pub fn load_with_padding(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -166,6 +171,7 @@ impl<B: Backend> ConvBnAct<B> {
         })
     }
 
+    /// Runs convolution, batch normalization, and activation for a BCHW feature map.
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let output = self.conv.forward(input);
         let output = self.norm.forward(output);
@@ -173,6 +179,7 @@ impl<B: Backend> ConvBnAct<B> {
     }
 }
 
+/// Loads a Paddle-style linear layer and transposes weights for Burn's layout.
 pub fn load_linear<B: Backend>(
     weights: &PPDocLayoutV3Weights,
     prefix: &str,
@@ -196,6 +203,7 @@ pub fn load_linear<B: Backend>(
     Ok(linear)
 }
 
+/// Loads a layer normalization module from PP-DocLayoutV3 checkpoint tensors.
 pub fn load_layer_norm<B: Backend>(
     weights: &PPDocLayoutV3Weights,
     prefix: &str,

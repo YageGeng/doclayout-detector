@@ -9,6 +9,8 @@ use burn::tensor::ops::{GridSampleOptions, InterpolateMode};
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_nn::{LayerNorm, Linear};
 use std::path::Path;
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+use tracing::Level;
 
 #[derive(Debug, Clone)]
 pub struct PPDocLayoutV3Model<B: Backend> {
@@ -41,11 +43,13 @@ pub struct PPDocLayoutV3Output<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3Model<B> {
+    /// Loads the PP-DocLayoutV3 checkpoint from disk and builds the model modules.
     pub fn load(path: &Path, device: &B::Device) -> Result<Self, LayoutError> {
         let weights = PPDocLayoutV3Weights::from_file(path)?;
         Self::load_weights(&weights, device)
     }
 
+    /// Builds all PP-DocLayoutV3 modules from an already validated weight store.
     pub fn load_weights(
         weights: &PPDocLayoutV3Weights,
         device: &B::Device,
@@ -106,31 +110,66 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         })
     }
 
+    /// Runs the complete synchronous model forward pass from image tensor to decoder outputs.
     pub fn forward(&self, pixel_values: Tensor<B, 4>) -> PPDocLayoutV3Output<B> {
         let prepared = self.prepare_decoder_inputs(pixel_values);
         self.forward_prepared(prepared)
     }
 
     #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+    /// Runs the complete browser WebGPU forward pass with async top-k readback support.
     pub async fn forward_async(
         &self,
         pixel_values: Tensor<B, 4>,
     ) -> Result<PPDocLayoutV3Output<B>, LayoutError> {
+        let total_profile = WasmForwardTimer::start("forward_async_total");
+        let encode_profile = WasmForwardTimer::start("forward_async_encode");
         let prepared = self.prepare_decoder_inputs_async(pixel_values).await?;
-        Ok(self.forward_prepared(prepared))
+        encode_profile.finish();
+
+        let forward_profile = WasmForwardTimer::start("forward_async_decoder_and_heads");
+        let output = self.forward_prepared(prepared);
+        forward_profile.finish();
+        total_profile.finish();
+        Ok(output)
     }
 
+    /// Runs the decoder and prediction heads after encoder proposal preparation.
     fn forward_prepared(&self, prepared: PPDocLayoutV3PreparedInputs<B>) -> PPDocLayoutV3Output<B> {
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("forward_decoder");
         let decoder_output = self.decoder.forward(
             prepared.target,
             prepared.reference_points_unact,
             prepared.source_flatten,
             prepared.spatial_shapes,
         );
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
+
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("forward_decoder_norm");
         let out_query = self.decoder_norm.forward(decoder_output.hidden_states);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
+
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("forward_score_head");
         let logits = self.enc_score_head.forward(out_query.clone());
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
+
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("forward_order_head");
         let order_query = self.decoder_order_head[5].forward(out_query);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
+
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("forward_global_pointer");
         let order_logits = self.decoder_global_pointer.forward(order_query);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
 
         PPDocLayoutV3Output {
             logits,
@@ -139,6 +178,7 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         }
     }
 
+    /// Returns encoder proposal logits and boxes without running the decoder stack.
     pub fn forward_encoder_proposals(
         &self,
         pixel_values: Tensor<B, 4>,
@@ -151,6 +191,7 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         }
     }
 
+    /// Prepares decoder inputs using backend-native proposal top-k selection.
     fn prepare_decoder_inputs(&self, pixel_values: Tensor<B, 4>) -> PPDocLayoutV3PreparedInputs<B> {
         let encoded = self.encode_decoder_inputs(pixel_values);
         let topk_indices = proposal_topk_indices(encoded.proposal_scores.clone(), encoded.topk);
@@ -158,45 +199,71 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
     }
 
     #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+    /// Prepares decoder inputs on wasm while avoiding unsupported synchronous WebGPU sorting.
     async fn prepare_decoder_inputs_async(
         &self,
         pixel_values: Tensor<B, 4>,
     ) -> Result<PPDocLayoutV3PreparedInputs<B>, LayoutError> {
         let encoded = self.encode_decoder_inputs(pixel_values);
+        let topk_profile = WasmForwardTimer::start("forward_async_topk");
         let topk_indices =
             proposal_topk_indices_async(encoded.proposal_scores.clone(), encoded.topk)
                 .await
                 .map_err(|error| LayoutError::InvalidModelOutput(error.to_string()))?;
-        Ok(self.prepare_decoder_inputs_from_topk(encoded, topk_indices))
+        topk_profile.finish();
+
+        let prepare_profile = WasmForwardTimer::start("prepare_decoder_from_topk");
+        let prepared = self.prepare_decoder_inputs_from_topk(encoded, topk_indices);
+        prepare_profile.finish();
+        Ok(prepared)
     }
 
+    /// Encodes image pixels into proposal tensors, mask features, and flattened decoder sources.
     fn encode_decoder_inputs(&self, pixel_values: Tensor<B, 4>) -> PPDocLayoutV3EncodedInputs<B> {
         debug_stats("pixel", &pixel_values);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("encode_backbone");
         let features = self.backbone.forward(pixel_values);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
         for (index, feature) in features.iter().enumerate() {
             debug_stats(&format!("backbone {index}"), feature);
         }
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("encode_input_projection");
         let projected = self.encoder_input_proj.forward(vec![
             features[1].clone(),
             features[2].clone(),
             features[3].clone(),
         ]);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
         for (index, feature) in projected.iter().enumerate() {
             debug_stats(&format!("proj {index}"), feature);
         }
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("encode_encoder");
         let encoder_outputs = self.encoder.forward(projected, vec![features[0].clone()]);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
         for (index, feature) in encoder_outputs.last_hidden_state.iter().enumerate() {
             debug_stats(&format!("enc {index}"), feature);
         }
         debug_stats("mask_feat", &encoder_outputs.mask_feat);
         let mask_feat = encoder_outputs.mask_feat.clone();
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("encode_decoder_input_projection");
         let sources = self
             .decoder_input_proj
             .forward(encoder_outputs.last_hidden_state);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
         for (index, source) in sources.iter().enumerate() {
             debug_stats(&format!("source {index}"), source);
         }
 
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("encode_flatten_anchors");
         let mut source_flatten = Vec::with_capacity(sources.len());
         let mut spatial_shapes = Vec::with_capacity(sources.len());
         for source in sources {
@@ -208,11 +275,20 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         let (anchors, valid_mask) =
             anchors_and_valid_mask(&spatial_shapes, source_flatten.device());
         let memory = source_flatten.clone() * valid_mask.clone().repeat_dim(2, 256);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
 
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("encode_output_memory");
         let output_memory = self
             .enc_output_norm
             .forward(self.enc_output_linear.forward(memory));
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
         debug_stats("output_memory", &output_memory);
+
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("encode_proposal_heads");
         let enc_outputs_class = self.enc_score_head.forward(output_memory.clone());
         debug_stats("enc_outputs_class", &enc_outputs_class);
         let enc_outputs_coord_logits = self.enc_bbox_head.forward(output_memory.clone()) + anchors;
@@ -220,6 +296,8 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         let topk = total_tokens.min(300);
         let proposal_scores = enc_outputs_class.clone().max_dim(2)
             - valid_mask.clone().neg().add_scalar(1.0).mul_scalar(1.0e8);
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
 
         PPDocLayoutV3EncodedInputs {
             output_memory,
@@ -233,29 +311,47 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         }
     }
 
+    /// Gathers top-k encoder proposals and derives decoder references from mask queries.
     fn prepare_decoder_inputs_from_topk(
         &self,
         encoded: PPDocLayoutV3EncodedInputs<B>,
         topk_indices: Tensor<B, 3, Int>,
     ) -> PPDocLayoutV3PreparedInputs<B> {
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("prepare_gather_encoder_logits");
         let encoder_logits = pad_queries(
             encoded
                 .enc_outputs_class
                 .gather(1, topk_indices.clone().repeat_dim(2, 25)),
             25,
         );
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
+
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("prepare_gather_reference_points");
         let encoder_reference_points_unact = pad_queries(
             encoded
                 .enc_outputs_coord_logits
                 .gather(1, topk_indices.clone().repeat_dim(2, 4)),
             4,
         );
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
+
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("prepare_gather_target");
         let target = pad_queries(
             encoded
                 .output_memory
                 .gather(1, topk_indices.repeat_dim(2, 256)),
             256,
         );
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
+
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        let profile = WasmForwardTimer::start("prepare_mask_query");
         let out_query = self.decoder_norm.forward(target.clone());
         let mask_query_embed = self.mask_query_head.forward(out_query);
         let [batch_size, query_count, _] = mask_query_embed.dims();
@@ -264,6 +360,8 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
             .matmul(encoded.mask_feat.flatten(2, 3))
             .reshape([batch_size, query_count, mask_height, mask_width]);
         let reference_points_unact = inverse_sigmoid(mask_to_box_coordinate(enc_out_masks));
+        #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+        profile.finish();
 
         PPDocLayoutV3PreparedInputs {
             target,
@@ -296,6 +394,7 @@ struct PPDocLayoutV3PreparedInputs<B: Backend> {
     encoder_logits: Tensor<B, 3>,
 }
 
+/// Repeats short proposal tensors so the decoder always receives 300 queries.
 fn pad_queries<B: Backend>(tensor: Tensor<B, 3>, channels: usize) -> Tensor<B, 3> {
     let query_count = tensor.dims()[1];
     if query_count >= 300 {
@@ -307,16 +406,19 @@ fn pad_queries<B: Backend>(tensor: Tensor<B, 3>, channels: usize) -> Tensor<B, 3
         .slice([0..1, 0..300, 0..channels])
 }
 
+/// Selects the top proposal indices on the active tensor backend.
 fn proposal_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
     let (_, indices) = scores.topk_with_indices(topk, 1);
     indices
 }
 
 #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+/// Selects proposal indices through an explicit async readback in the wasm path.
 async fn proposal_topk_indices_async<B: Backend>(
     scores: Tensor<B, 3>,
     topk: usize,
 ) -> Result<Tensor<B, 3, Int>, String> {
+    let profile = WasmForwardTimer::start("proposal_topk_readback");
     let device = scores.device();
     let dims = scores.dims();
     let values = scores
@@ -325,10 +427,12 @@ async fn proposal_topk_indices_async<B: Backend>(
         .map_err(|error| format!("read proposal scores tensor: {error}"))?
         .to_vec::<f32>()
         .map_err(|error| format!("decode proposal scores tensor: {error}"))?;
+    profile.finish();
     Ok(host_topk_indices_from_values(values, dims, topk, &device))
 }
 
 #[cfg(test)]
+/// Builds proposal top-k indices on the host for deterministic test expectations.
 fn host_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
     let device = scores.device();
     let dims = scores.dims();
@@ -340,6 +444,7 @@ fn host_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B,
 }
 
 #[cfg(any(test, all(target_family = "wasm", feature = "backend-webgpu")))]
+/// Converts host proposal scores into a backend tensor of selected indices.
 fn host_topk_indices_from_values<B: Backend>(
     values: Vec<f32>,
     dims: [usize; 3],
@@ -371,6 +476,7 @@ struct PPDocLayoutV3DecoderInputProjection<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3DecoderInputProjection<B> {
+    /// Loads decoder input projections for the three hybrid encoder feature levels.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -394,6 +500,7 @@ impl<B: Backend> PPDocLayoutV3DecoderInputProjection<B> {
         Ok(Self { projections })
     }
 
+    /// Projects encoder feature maps into the decoder source embedding space.
     fn forward(&self, inputs: Vec<Tensor<B, 4>>) -> Vec<Tensor<B, 4>> {
         self.projections
             .iter()
@@ -410,6 +517,7 @@ struct PPDocLayoutV3MlpPredictionHead<B: Backend> {
 
 impl<B: Backend> PPDocLayoutV3MlpPredictionHead<B> {
     #[allow(clippy::too_many_arguments)]
+    /// Loads a stacked linear MLP prediction head from checkpoint layers.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -439,6 +547,7 @@ impl<B: Backend> PPDocLayoutV3MlpPredictionHead<B> {
         Ok(Self { layers })
     }
 
+    /// Runs the MLP with ReLU between hidden layers and no activation on the output layer.
     fn forward(&self, mut input: Tensor<B, 3>) -> Tensor<B, 3> {
         for (index, layer) in self.layers.iter().enumerate() {
             input = layer.forward(input);
@@ -464,6 +573,7 @@ struct PPDocLayoutV3Decoder<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3Decoder<B> {
+    /// Loads decoder layers, query position projection, and tied bbox head weights.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -502,6 +612,7 @@ impl<B: Backend> PPDocLayoutV3Decoder<B> {
         })
     }
 
+    /// Iteratively refines hidden states and reference boxes across decoder layers.
     fn forward(
         &self,
         mut hidden_states: Tensor<B, 3>,
@@ -543,6 +654,7 @@ struct PPDocLayoutV3DecoderLayer<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3DecoderLayer<B> {
+    /// Loads one decoder layer with self-attention, deformable encoder attention, and FFN.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -582,6 +694,7 @@ impl<B: Backend> PPDocLayoutV3DecoderLayer<B> {
         })
     }
 
+    /// Runs query self-attention, multi-scale encoder attention, and the feed-forward block.
     fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
@@ -623,6 +736,7 @@ struct PPDocLayoutV3SelfAttention<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3SelfAttention<B> {
+    /// Loads multi-head self-attention projections for decoder query tokens.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -643,6 +757,7 @@ impl<B: Backend> PPDocLayoutV3SelfAttention<B> {
         })
     }
 
+    /// Computes scaled dot-product attention with optional positional embeddings.
     fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
@@ -686,6 +801,7 @@ struct PPDocLayoutV3MultiscaleDeformableAttention<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3MultiscaleDeformableAttention<B> {
+    /// Loads the multi-scale deformable attention projection layers.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -727,6 +843,7 @@ impl<B: Backend> PPDocLayoutV3MultiscaleDeformableAttention<B> {
         })
     }
 
+    /// Samples encoder feature levels around reference boxes and combines them with attention.
     fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
@@ -815,6 +932,7 @@ struct PPDocLayoutV3GlobalPointer<B: Backend> {
 }
 
 impl<B: Backend> PPDocLayoutV3GlobalPointer<B> {
+    /// Loads the dense projection used to produce pairwise reading-order logits.
     fn load(
         weights: &PPDocLayoutV3Weights,
         prefix: &str,
@@ -825,6 +943,7 @@ impl<B: Backend> PPDocLayoutV3GlobalPointer<B> {
         })
     }
 
+    /// Projects decoder tokens into query/key order embeddings and masks invalid pairs.
     fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, _] = input.dims();
         let projected = self
@@ -845,6 +964,7 @@ impl<B: Backend> PPDocLayoutV3GlobalPointer<B> {
     }
 }
 
+/// Masks the diagonal and lower triangle of pairwise order logits.
 fn mask_order_logits<B: Backend>(logits: Tensor<B, 3>) -> Tensor<B, 3> {
     let [batch_size, seq_len, _] = logits.dims();
     let device = logits.device();
@@ -859,6 +979,7 @@ fn mask_order_logits<B: Backend>(logits: Tensor<B, 3>) -> Tensor<B, 3> {
     logits.mask_fill(mask, -1.0e4)
 }
 
+/// Converts normalized coordinates from sigmoid space back into unbounded logits.
 fn inverse_sigmoid<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
     let input = input.clamp(0.0, 1.0);
     let x1 = input.clone().clamp_min(1e-5);
@@ -866,6 +987,7 @@ fn inverse_sigmoid<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
     (x1 / x2).log()
 }
 
+/// Creates normalized proposal anchors and a mask for anchors that stay inside the page.
 fn anchors_and_valid_mask<B: Backend>(
     spatial_shapes: &[(usize, usize)],
     device: B::Device,
@@ -898,10 +1020,12 @@ fn anchors_and_valid_mask<B: Backend>(
     )
 }
 
+/// Computes the scalar inverse sigmoid for valid anchor coordinates.
 fn logit(value: f32) -> f32 {
     (value / (1.0 - value)).ln()
 }
 
+/// Converts predicted masks into normalized center-x, center-y, width, and height boxes.
 fn mask_to_box_coordinate<B: Backend>(masks: Tensor<B, 4>) -> Tensor<B, 3> {
     let [batch_size, query_count, height, width] = masks.dims();
     let device = masks.device();
@@ -954,6 +1078,35 @@ fn mask_to_box_coordinate<B: Backend>(masks: Tensor<B, 4>) -> Tensor<B, 3> {
         .mask_fill(non_empty.bool_not().repeat_dim(2, 4), 0.0)
 }
 
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[derive(Debug, Clone)]
+struct WasmForwardTimer {
+    step: &'static str,
+    started_ms: f64,
+}
+
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+impl WasmForwardTimer {
+    /// Start a browser-compatible timer for a model forward step.
+    fn start(step: &'static str) -> Self {
+        Self {
+            step,
+            started_ms: js_sys::Date::now(),
+        }
+    }
+
+    /// Emit a tracing event with the elapsed duration for this step.
+    fn finish(self) {
+        tracing::event!(
+            Level::INFO,
+            step = self.step,
+            duration_ms = js_sys::Date::now() - self.started_ms,
+            "pp_doclayout forward step completed"
+        );
+    }
+}
+
+/// Emits optional tensor statistics when `LITEPARSE_LAYOUT_DEBUG_STATS` is enabled.
 fn debug_stats<B: Backend, const D: usize>(name: &str, tensor: &Tensor<B, D>) {
     if std::env::var_os("LITEPARSE_LAYOUT_DEBUG_STATS").is_none() {
         return;

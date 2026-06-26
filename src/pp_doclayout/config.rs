@@ -21,6 +21,7 @@ pub struct PPDocLayoutV3Config {
 }
 
 impl Default for PPDocLayoutV3Config {
+    /// Returns the PP-DocLayoutV3 architecture constants used by the loaded checkpoint.
     fn default() -> Self {
         Self {
             image_size: PP_DOCLAYOUT_V3_IMAGE_SIZE,
