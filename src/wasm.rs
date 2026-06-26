@@ -2,7 +2,8 @@ use crate::PageImage;
 use crate::annotate::{AnnotatedDetection, annotate_page_rgba};
 use crate::model::EmbeddedModel;
 use crate::pp_doclayout::{PPDocLayoutV3Detector, PPDocLayoutV3Options};
-use pdfium::Library;
+use pdfium::{Bitmap, Library};
+use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -15,7 +16,9 @@ pub fn wasm_start() {
 #[wasm_bindgen]
 pub struct PPDocLayoutWasm {
     options: PPDocLayoutV3Options,
-    detector: std::cell::RefCell<Option<PPDocLayoutV3Detector<EmbeddedModel>>>,
+    detector: RefCell<Option<PPDocLayoutV3Detector<EmbeddedModel>>>,
+    pdf_data: RefCell<Option<Vec<u8>>>,
+    page_count: Cell<u32>,
 }
 
 #[wasm_bindgen]
@@ -24,17 +27,29 @@ impl PPDocLayoutWasm {
     pub fn new() -> Self {
         Self {
             options: PPDocLayoutV3Options::default(),
-            detector: std::cell::RefCell::new(None),
+            detector: RefCell::new(None),
+            pdf_data: RefCell::new(None),
+            page_count: Cell::new(0),
         }
+    }
+
+    #[wasm_bindgen(js_name = loadPdf)]
+    pub fn load_pdf(&self, data: Vec<u8>) -> Result<u32, JsError> {
+        let page_count = pdf_page_count(&data)?;
+        *self.pdf_data.borrow_mut() = Some(data);
+        self.page_count.set(page_count);
+        tracing::info!(pages = page_count, "loaded PDF into wasm cache");
+        Ok(page_count)
+    }
+
+    #[wasm_bindgen(js_name = loadedPageCount)]
+    pub fn loaded_page_count(&self) -> u32 {
+        self.page_count.get()
     }
 
     #[wasm_bindgen(js_name = pageCount)]
     pub fn page_count(&self, data: Vec<u8>) -> Result<u32, JsError> {
-        let lib = Library::init();
-        let document = lib
-            .load_document_from_bytes(&data, None)
-            .map_err(|error| JsError::new(&format!("failed to load PDF: {error}")))?;
-        Ok(document.page_count() as u32)
+        pdf_page_count(&data)
     }
 
     #[wasm_bindgen(js_name = detectPage)]
@@ -46,6 +61,33 @@ impl PPDocLayoutWasm {
     ) -> Result<JsValue, JsError> {
         let detector = self.detector().await?;
         let rendered = render_pdf_page(&data, page_number, dpi)?;
+        self.detect_rendered_page(detector, rendered, page_number, dpi)
+            .await
+    }
+
+    #[wasm_bindgen(js_name = detectLoadedPage)]
+    pub async fn detect_loaded_page(&self, page_number: u32, dpi: f32) -> Result<JsValue, JsError> {
+        let detector = self.detector().await?;
+        let rendered = {
+            let pdf_data = self.pdf_data.borrow();
+            let data = pdf_data
+                .as_deref()
+                .ok_or_else(|| JsError::new("no PDF loaded; call loadPdf first"))?;
+            render_pdf_page(data, page_number, dpi)?
+        };
+        self.detect_rendered_page(detector, rendered, page_number, dpi)
+            .await
+    }
+}
+
+impl PPDocLayoutWasm {
+    async fn detect_rendered_page(
+        &self,
+        detector: PPDocLayoutV3Detector<EmbeddedModel>,
+        rendered: RenderedPage,
+        page_number: u32,
+        dpi: f32,
+    ) -> Result<JsValue, JsError> {
         let image = PageImage {
             rgb: &rendered.rgb,
             width: rendered.width,
@@ -55,7 +97,8 @@ impl PPDocLayoutWasm {
             dpi,
         };
         let detections = detector
-            .detect_page(&image)
+            .detect_page_async(&image)
+            .await
             .map_err(|error| JsError::new(&format!("layout detection failed: {error}")))?;
 
         let annotated = detections
@@ -86,9 +129,7 @@ impl PPDocLayoutWasm {
         serde_wasm_bindgen::to_value(&result)
             .map_err(|error| JsError::new(&format!("failed to encode page result: {error}")))
     }
-}
 
-impl PPDocLayoutWasm {
     async fn detector(&self) -> Result<PPDocLayoutV3Detector<EmbeddedModel>, JsError> {
         if let Some(detector) = self.detector.borrow().clone() {
             return Ok(detector);
@@ -125,6 +166,14 @@ struct WasmPageResult<'a> {
     image_bytes: &'a [u8],
 }
 
+fn pdf_page_count(data: &[u8]) -> Result<u32, JsError> {
+    let lib = Library::init();
+    let document = lib
+        .load_document_from_bytes(data, None)
+        .map_err(|error| JsError::new(&format!("failed to load PDF: {error}")))?;
+    Ok(document.page_count() as u32)
+}
+
 fn render_pdf_page(data: &[u8], page_number: u32, dpi: f32) -> Result<RenderedPage, JsError> {
     if page_number == 0 {
         return Err(JsError::new(
@@ -152,14 +201,39 @@ fn render_pdf_page(data: &[u8], page_number: u32, dpi: f32) -> Result<RenderedPa
         .render(dpi)
         .map_err(|error| JsError::new(&format!("failed to render page {page_number}: {error}")))?;
 
+    let (rgb, rgba) = bitmap_to_rgb_and_rgba(&bitmap);
+
     Ok(RenderedPage {
         width: bitmap.width() as u32,
         height: bitmap.height() as u32,
         page_width,
         page_height,
-        rgb: bitmap.to_rgb(),
-        rgba: bitmap.to_rgba(),
+        rgb,
+        rgba,
     })
+}
+
+fn bitmap_to_rgb_and_rgba(bitmap: &Bitmap<'_>) -> (Vec<u8>, Vec<u8>) {
+    let width = bitmap.width() as usize;
+    let height = bitmap.height() as usize;
+    let stride = bitmap.stride() as usize;
+    let src = bitmap.buffer();
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+
+    for y in 0..height {
+        let row = &src[y * stride..y * stride + width * 4];
+        for pixel in row.chunks_exact(4) {
+            let red = pixel[2];
+            let green = pixel[1];
+            let blue = pixel[0];
+            let alpha = pixel[3];
+            rgb.extend_from_slice(&[red, green, blue]);
+            rgba.extend_from_slice(&[red, green, blue, alpha]);
+        }
+    }
+
+    (rgb, rgba)
 }
 
 fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, JsError> {

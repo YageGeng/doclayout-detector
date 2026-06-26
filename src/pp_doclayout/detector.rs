@@ -59,3 +59,27 @@ where
         )
     }
 }
+
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+impl PPDocLayoutV3Detector<crate::model::EmbeddedModel> {
+    pub async fn detect_page_async(
+        &self,
+        image: &PageImage<'_>,
+    ) -> Result<Vec<PPDocLayoutV3Detection>, LayoutError> {
+        validate_page_image(image)?;
+        if self.options.image_size != PP_DOCLAYOUT_V3_IMAGE_SIZE {
+            return Err(LayoutError::UnsupportedImageSize {
+                expected: PP_DOCLAYOUT_V3_IMAGE_SIZE,
+                actual: self.options.image_size,
+            });
+        }
+
+        let input = resize_rgb_to_chw_f32(image, self.options.image_size)?;
+        let outputs = self.model.infer_async(&input).await?;
+        decode_box_detections(
+            &outputs.as_raw_outputs(),
+            image,
+            self.options.confidence_threshold,
+        )
+    }
+}

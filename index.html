@@ -262,8 +262,9 @@
         }
 
         pdfBytes = new Uint8Array(await file.arrayBuffer());
+        const count = detector ? detector.loadPdf(pdfBytes) : 0;
         runButton.disabled = !detector;
-        setStatus(`${file.name} loaded.`);
+        setStatus(detector ? `${file.name} loaded · ${count} pages.` : `${file.name} loaded.`);
       });
 
       runButton.addEventListener("click", async () => {
@@ -274,13 +275,18 @@
 
         try {
           const dpi = Number(dpiInput.value || 144);
-          const count = detector.pageCount(pdfBytes);
+          const count = detector.loadedPageCount() || detector.loadPdf(pdfBytes);
+          const startedAt = performance.now();
           for (let pageNumber = 1; pageNumber <= count; pageNumber += 1) {
             setStatus(`Detecting page ${pageNumber} of ${count}...`);
-            const page = await detector.detectPage(pdfBytes, pageNumber, dpi);
+            const pageStartedAt = performance.now();
+            const page = await detector.detectLoadedPage(pageNumber, dpi);
             appendPage(page);
+            const pageMs = Math.round(performance.now() - pageStartedAt);
+            setStatus(`Detected page ${pageNumber} of ${count} in ${pageMs} ms.`);
           }
-          setStatus(`Finished ${count} page${count === 1 ? "" : "s"}.`);
+          const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+          setStatus(`Finished ${count} page${count === 1 ? "" : "s"} in ${elapsedSeconds}s.`);
         } catch (error) {
           setStatus(error instanceof Error ? error.message : String(error));
         } finally {

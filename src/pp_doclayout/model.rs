@@ -6,7 +6,7 @@ use crate::error::LayoutError;
 use burn::tensor::activation::{relu, sigmoid, softmax};
 use burn::tensor::backend::Backend;
 use burn::tensor::ops::{GridSampleOptions, InterpolateMode};
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Int, Tensor, TensorData};
 use burn_nn::{LayerNorm, Linear};
 use std::path::Path;
 
@@ -108,6 +108,19 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
 
     pub fn forward(&self, pixel_values: Tensor<B, 4>) -> PPDocLayoutV3Output<B> {
         let prepared = self.prepare_decoder_inputs(pixel_values);
+        self.forward_prepared(prepared)
+    }
+
+    #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+    pub async fn forward_async(
+        &self,
+        pixel_values: Tensor<B, 4>,
+    ) -> Result<PPDocLayoutV3Output<B>, LayoutError> {
+        let prepared = self.prepare_decoder_inputs_async(pixel_values).await?;
+        Ok(self.forward_prepared(prepared))
+    }
+
+    fn forward_prepared(&self, prepared: PPDocLayoutV3PreparedInputs<B>) -> PPDocLayoutV3Output<B> {
         let decoder_output = self.decoder.forward(
             prepared.target,
             prepared.reference_points_unact,
@@ -139,6 +152,25 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
     }
 
     fn prepare_decoder_inputs(&self, pixel_values: Tensor<B, 4>) -> PPDocLayoutV3PreparedInputs<B> {
+        let encoded = self.encode_decoder_inputs(pixel_values);
+        let topk_indices = proposal_topk_indices(encoded.proposal_scores.clone(), encoded.topk);
+        self.prepare_decoder_inputs_from_topk(encoded, topk_indices)
+    }
+
+    #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+    async fn prepare_decoder_inputs_async(
+        &self,
+        pixel_values: Tensor<B, 4>,
+    ) -> Result<PPDocLayoutV3PreparedInputs<B>, LayoutError> {
+        let encoded = self.encode_decoder_inputs(pixel_values);
+        let topk_indices =
+            proposal_topk_indices_async(encoded.proposal_scores.clone(), encoded.topk)
+                .await
+                .map_err(|error| LayoutError::InvalidModelOutput(error.to_string()))?;
+        Ok(self.prepare_decoder_inputs_from_topk(encoded, topk_indices))
+    }
+
+    fn encode_decoder_inputs(&self, pixel_values: Tensor<B, 4>) -> PPDocLayoutV3EncodedInputs<B> {
         debug_stats("pixel", &pixel_values);
         let features = self.backbone.forward(pixel_values);
         for (index, feature) in features.iter().enumerate() {
@@ -188,41 +220,71 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
         let topk = total_tokens.min(300);
         let proposal_scores = enc_outputs_class.clone().max_dim(2)
             - valid_mask.clone().neg().add_scalar(1.0).mul_scalar(1.0e8);
-        let (_, topk_indices) = proposal_scores.topk_with_indices(topk, 1);
 
+        PPDocLayoutV3EncodedInputs {
+            output_memory,
+            enc_outputs_class,
+            enc_outputs_coord_logits,
+            mask_feat,
+            source_flatten,
+            spatial_shapes,
+            proposal_scores,
+            topk,
+        }
+    }
+
+    fn prepare_decoder_inputs_from_topk(
+        &self,
+        encoded: PPDocLayoutV3EncodedInputs<B>,
+        topk_indices: Tensor<B, 3, Int>,
+    ) -> PPDocLayoutV3PreparedInputs<B> {
         let encoder_logits = pad_queries(
-            enc_outputs_class.gather(1, topk_indices.clone().repeat_dim(2, 25)),
+            encoded
+                .enc_outputs_class
+                .gather(1, topk_indices.clone().repeat_dim(2, 25)),
             25,
         );
         let encoder_reference_points_unact = pad_queries(
-            enc_outputs_coord_logits.gather(1, topk_indices.clone().repeat_dim(2, 4)),
+            encoded
+                .enc_outputs_coord_logits
+                .gather(1, topk_indices.clone().repeat_dim(2, 4)),
             4,
         );
         let target = pad_queries(
-            output_memory.gather(1, topk_indices.repeat_dim(2, 256)),
+            encoded
+                .output_memory
+                .gather(1, topk_indices.repeat_dim(2, 256)),
             256,
         );
         let out_query = self.decoder_norm.forward(target.clone());
         let mask_query_embed = self.mask_query_head.forward(out_query);
         let [batch_size, query_count, _] = mask_query_embed.dims();
-        let [_, _, mask_height, mask_width] = mask_feat.dims();
-        let enc_out_masks = mask_query_embed.matmul(mask_feat.flatten(2, 3)).reshape([
-            batch_size,
-            query_count,
-            mask_height,
-            mask_width,
-        ]);
+        let [_, _, mask_height, mask_width] = encoded.mask_feat.dims();
+        let enc_out_masks = mask_query_embed
+            .matmul(encoded.mask_feat.flatten(2, 3))
+            .reshape([batch_size, query_count, mask_height, mask_width]);
         let reference_points_unact = inverse_sigmoid(mask_to_box_coordinate(enc_out_masks));
 
         PPDocLayoutV3PreparedInputs {
             target,
             reference_points_unact,
             encoder_reference_points_unact,
-            source_flatten,
-            spatial_shapes,
+            source_flatten: encoded.source_flatten,
+            spatial_shapes: encoded.spatial_shapes,
             encoder_logits,
         }
     }
+}
+
+struct PPDocLayoutV3EncodedInputs<B: Backend> {
+    output_memory: Tensor<B, 3>,
+    enc_outputs_class: Tensor<B, 3>,
+    enc_outputs_coord_logits: Tensor<B, 3>,
+    mask_feat: Tensor<B, 4>,
+    source_flatten: Tensor<B, 3>,
+    spatial_shapes: Vec<(usize, usize)>,
+    proposal_scores: Tensor<B, 3>,
+    topk: usize,
 }
 
 struct PPDocLayoutV3PreparedInputs<B: Backend> {
@@ -243,6 +305,64 @@ fn pad_queries<B: Backend>(tensor: Tensor<B, 3>, channels: usize) -> Tensor<B, 3
     tensor
         .repeat_dim(1, repeat)
         .slice([0..1, 0..300, 0..channels])
+}
+
+fn proposal_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
+    let (_, indices) = scores.topk_with_indices(topk, 1);
+    indices
+}
+
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+async fn proposal_topk_indices_async<B: Backend>(
+    scores: Tensor<B, 3>,
+    topk: usize,
+) -> Result<Tensor<B, 3, Int>, String> {
+    let device = scores.device();
+    let dims = scores.dims();
+    let values = scores
+        .into_data_async()
+        .await
+        .map_err(|error| format!("read proposal scores tensor: {error}"))?
+        .to_vec::<f32>()
+        .map_err(|error| format!("decode proposal scores tensor: {error}"))?;
+    Ok(host_topk_indices_from_values(values, dims, topk, &device))
+}
+
+#[cfg(test)]
+fn host_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
+    let device = scores.device();
+    let dims = scores.dims();
+    let values = scores
+        .into_data()
+        .to_vec::<f32>()
+        .expect("failed to read proposal scores for host top-k");
+    host_topk_indices_from_values(values, dims, topk, &device)
+}
+
+#[cfg(any(test, all(target_family = "wasm", feature = "backend-webgpu")))]
+fn host_topk_indices_from_values<B: Backend>(
+    values: Vec<f32>,
+    dims: [usize; 3],
+    topk: usize,
+    device: &B::Device,
+) -> Tensor<B, 3, Int> {
+    let [batch_size, token_count, channels] = dims;
+    assert_eq!(
+        channels, 1,
+        "proposal scores are expected to have a singleton channel dimension"
+    );
+    let mut indices = Vec::with_capacity(batch_size * topk);
+    for batch_index in 0..batch_size {
+        let batch_offset = batch_index * token_count;
+        let mut ranked = (0..token_count).collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| {
+            values[batch_offset + *right].total_cmp(&values[batch_offset + *left])
+        });
+        indices.extend(ranked.into_iter().take(topk).map(|index| index as i64));
+    }
+
+    Tensor::<B, 2, Int>::from_data(TensorData::new(indices, [batch_size, topk]), device)
+        .reshape([batch_size, topk, 1])
 }
 
 #[derive(Debug, Clone)]
@@ -889,6 +1009,20 @@ mod tests {
         assert!((values[2] - 0.4).abs() < 1e-6);
         assert!((values[3] - 0.5).abs() < 1e-6);
         assert_eq!(&values[4..8], &[0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn host_topk_indices_selects_highest_proposal_scores() {
+        let device = burn_ndarray::NdArrayDevice::Cpu;
+        let scores = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.1, 0.7, -2.0, 1.3, 0.5], [1, 5, 1]),
+            &device,
+        );
+
+        let indices = host_topk_indices(scores, 3);
+        let values = indices.into_data().to_vec::<i64>().unwrap();
+
+        assert_eq!(values, vec![3, 1, 4]);
     }
 
     #[test]

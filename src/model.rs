@@ -155,6 +155,90 @@ impl PPDocLayoutV3Inference for EmbeddedModel {
     }
 }
 
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+impl EmbeddedModel {
+    pub async fn infer_async(
+        &self,
+        input: &[f32],
+    ) -> Result<PPDocLayoutV3OwnedOutputs, LayoutError> {
+        let expected =
+            3 * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize * PP_DOCLAYOUT_V3_IMAGE_SIZE as usize;
+        if input.len() != expected {
+            return Err(LayoutError::InvalidModelOutput(format!(
+                "expected CHW input length {expected}, got {}",
+                input.len()
+            )));
+        }
+
+        let tensor = Tensor::<LayoutBackend, 4>::from_data(
+            TensorData::new(
+                input.to_vec(),
+                [
+                    1,
+                    3,
+                    PP_DOCLAYOUT_V3_IMAGE_SIZE as usize,
+                    PP_DOCLAYOUT_V3_IMAGE_SIZE as usize,
+                ],
+            ),
+            &self.device,
+        );
+        let output = self.model.forward_async(tensor).await?;
+        let logits_shape = output.logits.dims();
+        let pred_boxes_shape = output.pred_boxes.dims();
+        let order_logits_shape = output.order_logits.as_ref().map(|tensor| tensor.dims());
+        let logits = output
+            .logits
+            .into_data_async()
+            .await
+            .map_err(|error| {
+                LayoutError::InvalidModelOutput(format!("read logits tensor: {error}"))
+            })?
+            .to_vec::<f32>()
+            .map_err(|error| {
+                LayoutError::InvalidModelOutput(format!("decode logits tensor: {error}"))
+            })?;
+        let pred_boxes = output
+            .pred_boxes
+            .into_data_async()
+            .await
+            .map_err(|error| {
+                LayoutError::InvalidModelOutput(format!("read pred boxes tensor: {error}"))
+            })?
+            .to_vec::<f32>()
+            .map_err(|error| {
+                LayoutError::InvalidModelOutput(format!("decode pred boxes tensor: {error}"))
+            })?;
+        let order_logits = match output.order_logits {
+            Some(tensor) => Some(
+                tensor
+                    .into_data_async()
+                    .await
+                    .map_err(|error| {
+                        LayoutError::InvalidModelOutput(format!(
+                            "read order logits tensor: {error}"
+                        ))
+                    })?
+                    .to_vec::<f32>()
+                    .map_err(|error| {
+                        LayoutError::InvalidModelOutput(format!(
+                            "decode order logits tensor: {error}"
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+
+        Ok(PPDocLayoutV3OwnedOutputs {
+            logits_shape,
+            logits,
+            pred_boxes_shape,
+            pred_boxes,
+            order_logits_shape,
+            order_logits,
+        })
+    }
+}
+
 fn load_model(device: &LayoutDevice) -> Result<PPDocLayoutV3Model<LayoutBackend>, LayoutError> {
     let weights = PPDocLayoutV3Weights::from_bytes(
         include_bytes!("../models/pp_doclayout_v3/model.safetensors").to_vec(),
