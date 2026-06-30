@@ -54,6 +54,18 @@ impl PPDocLayoutV3Weights {
         name: &str,
         device: &B::Device,
     ) -> Result<Tensor<B, D>, LayoutError> {
+        let (values, shape) = self.tensor_f32_values::<D>(name)?;
+        Ok(Tensor::<B, D>::from_data(
+            TensorData::new(values, shape),
+            device,
+        ))
+    }
+
+    /// Loads one F32 tensor into host values with the expected rank.
+    pub(crate) fn tensor_f32_values<const D: usize>(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<f32>, [usize; D]), LayoutError> {
         let tensors = self.tensors()?;
         let tensor = tensors.tensor(name).map_err(|error| {
             LayoutError::InvalidModelOutput(format!("load tensor {name}: {error}"))
@@ -75,10 +87,13 @@ impl PPDocLayoutV3Weights {
         for chunk in tensor.data().chunks_exact(4) {
             values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
-        Ok(Tensor::<B, D>::from_data(
-            TensorData::new(values, tensor.shape().to_vec()),
-            device,
-        ))
+        let shape = tensor.shape().try_into().map_err(|_| {
+            LayoutError::InvalidModelOutput(format!(
+                "expected tensor {name} rank {D}, got shape {:?}",
+                tensor.shape()
+            ))
+        })?;
+        Ok((values, shape))
     }
 
     /// Validates that the safetensors payload can be deserialized.

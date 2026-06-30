@@ -243,7 +243,7 @@ impl<B: Backend> PPDocLayoutV3Model<B> {
             source_flatten.push(source.flatten(2, 3).swap_dims(1, 2));
         }
         let source_flatten = Tensor::cat(source_flatten, 1);
-        let (_, valid_mask) = anchors_and_valid_mask(&spatial_shapes, source_flatten.device());
+        let valid_mask = valid_mask_for_spatial_shapes(&spatial_shapes, source_flatten.device());
         let memory = source_flatten.clone() * valid_mask.clone().repeat_dim(2, 256);
         #[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
         profile.finish();
@@ -924,13 +924,23 @@ fn inverse_sigmoid<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
     (x1 / x2).log()
 }
 
-/// Creates normalized proposal anchors and a mask for anchors that stay inside the page.
-fn anchors_and_valid_mask<B: Backend>(
+/// Creates a mask for proposal locations that stay inside the page.
+fn valid_mask_for_spatial_shapes<B: Backend>(
     spatial_shapes: &[(usize, usize)],
     device: B::Device,
-) -> (Tensor<B, 3>, Tensor<B, 3>) {
-    let mut anchors = Vec::new();
-    let mut valid_mask = Vec::new();
+) -> Tensor<B, 3> {
+    let valid_mask = valid_mask_values_for_spatial_shapes(spatial_shapes);
+    let total_tokens = valid_mask.len();
+    Tensor::from_data(TensorData::new(valid_mask, [1, total_tokens, 1]), &device)
+}
+
+/// Creates host mask values for proposal locations that stay inside the page.
+fn valid_mask_values_for_spatial_shapes(spatial_shapes: &[(usize, usize)]) -> Vec<f32> {
+    let total_tokens = spatial_shapes
+        .iter()
+        .map(|(height, width)| height * width)
+        .sum();
+    let mut valid_mask = Vec::with_capacity(total_tokens);
     for (level, (height, width)) in spatial_shapes.iter().copied().enumerate() {
         let wh = 0.05_f32 * 2.0_f32.powi(level as i32);
         for y in 0..height {
@@ -939,27 +949,10 @@ fn anchors_and_valid_mask<B: Backend>(
                 let cy = (y as f32 + 0.5) / height as f32;
                 let valid = cx > 0.01 && cx < 0.99 && cy > 0.01 && cy < 0.99 && wh < 0.99;
                 valid_mask.push(if valid { 1.0 } else { 0.0 });
-                if valid {
-                    anchors.push(logit(cx));
-                    anchors.push(logit(cy));
-                    anchors.push(logit(wh));
-                    anchors.push(logit(wh));
-                } else {
-                    anchors.extend([1.0e8; 4]);
-                }
             }
         }
     }
-    let total = valid_mask.len();
-    (
-        Tensor::from_data(TensorData::new(anchors, [1, total, 4]), &device),
-        Tensor::from_data(TensorData::new(valid_mask, [1, total, 1]), &device),
-    )
-}
-
-/// Computes the scalar inverse sigmoid for valid anchor coordinates.
-fn logit(value: f32) -> f32 {
-    (value / (1.0 - value)).ln()
+    valid_mask
 }
 
 /// Converts predicted masks into normalized center-x, center-y, width, and height boxes.
@@ -1153,5 +1146,17 @@ mod tests {
         assert_eq!(values[6], -1.0e4);
         assert_eq!(values[7], -1.0e4);
         assert_eq!(values[8], -1.0e4);
+    }
+
+    #[test]
+    fn valid_mask_for_spatial_shapes_marks_border_tokens_invalid() {
+        let values = valid_mask_values_for_spatial_shapes(&[(1, 100), (2, 2)]);
+
+        assert_eq!(values.len(), 104);
+        assert_eq!(values[0], 0.0);
+        assert_eq!(values[1], 1.0);
+        assert_eq!(values[98], 1.0);
+        assert_eq!(values[99], 0.0);
+        assert_eq!(&values[100..104], &[1.0; 4]);
     }
 }
