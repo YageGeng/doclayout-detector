@@ -5,16 +5,24 @@ use doclayout_detector::pp_doclayout::{
 use std::path::Path;
 use std::sync::Once;
 
-type TestBackend = burn_wgpu::Vulkan;
+type TestBackend = doclayout_detector::model::LayoutBackend;
+
 static INIT_WGPU: Once = Once::new();
 
-/// Returns the shared Vulkan test device after one-time Burn WGPU initialization.
+/// Returns the shared test device after one-time Burn WGPU initialization.
 fn test_device() -> burn_wgpu::WgpuDevice {
     let device = burn_wgpu::WgpuDevice::DefaultDevice;
-    INIT_WGPU.call_once(|| {
-        burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(&device, Default::default());
-    });
+    INIT_WGPU.call_once(|| init_wgpu_test_backend(&device));
     device
+}
+
+fn init_wgpu_test_backend(device: &burn_wgpu::WgpuDevice) {
+    #[cfg(feature = "backend-metal")]
+    burn_wgpu::init_setup::<burn_wgpu::graphics::Metal>(device, Default::default());
+    #[cfg(feature = "backend-vulkan")]
+    burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(device, Default::default());
+    #[cfg(feature = "backend-webgpu")]
+    burn_wgpu::init_setup::<burn_wgpu::graphics::WebGpu>(device, Default::default());
 }
 
 #[test]

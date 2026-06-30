@@ -16,6 +16,15 @@ compile_error!(
     "select one layout backend feature: backend-metal, backend-vulkan, or backend-webgpu"
 );
 
+#[cfg(any(
+    all(feature = "backend-metal", feature = "backend-vulkan"),
+    all(feature = "backend-metal", feature = "backend-webgpu"),
+    all(feature = "backend-vulkan", feature = "backend-webgpu")
+))]
+compile_error!(
+    "select exactly one layout backend feature: backend-metal, backend-vulkan, or backend-webgpu"
+);
+
 #[cfg(all(
     feature = "backend-metal",
     not(any(feature = "backend-vulkan", feature = "backend-webgpu"))

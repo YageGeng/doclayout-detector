@@ -345,6 +345,13 @@ fn pad_queries<B: Backend>(tensor: Tensor<B, 3>, channels: usize) -> Tensor<B, 3
         .slice([0..1, 0..300, 0..channels])
 }
 
+#[cfg(all(not(target_family = "wasm"), feature = "backend-metal"))]
+/// Selects proposal indices with sort-backed top-k to avoid Metal reduce shader failures.
+fn proposal_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
+    scores.topk_with_indices(topk, 1).1
+}
+
+#[cfg(not(all(not(target_family = "wasm"), feature = "backend-metal")))]
 /// Selects proposal indices with the active backend's top-k kernel.
 fn proposal_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
     scores.argtopk(topk, 1)
@@ -362,7 +369,10 @@ async fn proposal_topk_indices_async<B: Backend>(
     Ok(indices)
 }
 
-#[cfg(any(test, all(target_family = "wasm", feature = "backend-webgpu")))]
+#[cfg(any(
+    all(test, not(all(not(target_family = "wasm"), feature = "backend-metal"))),
+    all(target_family = "wasm", feature = "backend-webgpu")
+))]
 /// Selects proposal indices without host readback by repeatedly masking GPU argmax winners.
 fn gpu_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
     let [batch_size, token_count, channels] = scores.dims();
@@ -1068,53 +1078,24 @@ mod tests {
     use super::*;
     use std::sync::Once;
 
-    type TestBackend = burn_wgpu::Vulkan;
+    type TestBackend = crate::model::LayoutBackend;
+
     static INIT_WGPU: Once = Once::new();
 
-    /// Returns the shared Vulkan test device after one-time Burn WGPU initialization.
+    /// Returns the shared test device after one-time Burn WGPU initialization.
     fn test_device() -> burn_wgpu::WgpuDevice {
         let device = burn_wgpu::WgpuDevice::DefaultDevice;
-        INIT_WGPU.call_once(|| {
-            burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(&device, Default::default());
-        });
+        INIT_WGPU.call_once(|| init_wgpu_test_backend(&device));
         device
     }
 
-    /// Builds proposal top-k indices on the host for deterministic test expectations.
-    fn host_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
-        let device = scores.device();
-        let dims = scores.dims();
-        let values = scores
-            .into_data()
-            .to_vec::<f32>()
-            .expect("failed to read proposal scores for host top-k");
-        host_topk_indices_from_values(values, dims, topk, &device)
-    }
-
-    /// Converts host proposal scores into a backend tensor of selected indices.
-    fn host_topk_indices_from_values<B: Backend>(
-        values: Vec<f32>,
-        dims: [usize; 3],
-        topk: usize,
-        device: &B::Device,
-    ) -> Tensor<B, 3, Int> {
-        let [batch_size, token_count, channels] = dims;
-        assert_eq!(
-            channels, 1,
-            "proposal scores are expected to have a singleton channel dimension"
-        );
-        let mut indices = Vec::with_capacity(batch_size * topk);
-        for batch_index in 0..batch_size {
-            let batch_offset = batch_index * token_count;
-            let mut ranked = (0..token_count).collect::<Vec<_>>();
-            ranked.sort_unstable_by(|left, right| {
-                values[batch_offset + *right].total_cmp(&values[batch_offset + *left])
-            });
-            indices.extend(ranked.into_iter().take(topk).map(|index| index as i32));
-        }
-
-        Tensor::<B, 2, Int>::from_data(TensorData::new(indices, [batch_size, topk]), device)
-            .reshape([batch_size, topk, 1])
+    fn init_wgpu_test_backend(device: &burn_wgpu::WgpuDevice) {
+        #[cfg(feature = "backend-metal")]
+        burn_wgpu::init_setup::<burn_wgpu::graphics::Metal>(device, Default::default());
+        #[cfg(feature = "backend-vulkan")]
+        burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(device, Default::default());
+        #[cfg(feature = "backend-webgpu")]
+        burn_wgpu::init_setup::<burn_wgpu::graphics::WebGpu>(device, Default::default());
     }
 
     #[test]
@@ -1139,20 +1120,7 @@ mod tests {
         assert_eq!(&values[4..8], &[0.0, 0.0, 0.0, 0.0]);
     }
 
-    #[test]
-    fn host_topk_indices_selects_highest_proposal_scores() {
-        let device = test_device();
-        let scores = Tensor::<TestBackend, 3>::from_data(
-            TensorData::new(vec![0.1, 0.7, -2.0, 1.3, 0.5], [1, 5, 1]),
-            &device,
-        );
-
-        let indices = host_topk_indices(scores, 3);
-        let values = indices.into_data().to_vec::<i32>().unwrap();
-
-        assert_eq!(values, vec![3, 1, 4]);
-    }
-
+    #[cfg(not(all(not(target_family = "wasm"), feature = "backend-metal")))]
     #[test]
     fn gpu_topk_indices_selects_highest_proposal_scores() {
         let device = test_device();
