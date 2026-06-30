@@ -43,6 +43,40 @@ test("preview page exposes batch progress controls for detect all", async () => 
   assert.match(html, /\.legend\s*\{[\s\S]*?width:\s*132px/);
 });
 
+test("preview page runs wasm detection in a web worker", async () => {
+  const html = await readFile("index.html", "utf8");
+
+  assert.match(html, /new Worker\("wasm\/doclayout-worker\.js", \{ type: "module" \}\)/);
+  assert.match(html, /requestWorker\("detectLoadedPage"/);
+  assert.match(html, /requestWorker\("detectLoadedPages"/);
+  assert.doesNotMatch(html, /new PPDocLayoutWasm\(\)/);
+});
+
+test("preview page yields frames between long worker requests", async () => {
+  const html = await readFile("index.html", "utf8");
+
+  assert.match(html, /function nextFrame\(\)/);
+  assert.match(html, /const INTER_BATCH_PAUSE_MS = 60/);
+  assert.match(html, /function sleep\(ms\)/);
+  assert.match(html, /await nextFrame\(\);[\s\S]*?requestWorker\("detectLoadedPage"/);
+  assert.match(html, /await nextFrame\(\);[\s\S]*?requestWorker\("detectLoadedPages"/);
+  assert.match(html, /appendPage\(page\);[\s\S]*?await nextFrame\(\)/);
+  assert.match(html, /await sleep\(INTER_BATCH_PAUSE_MS\)/);
+});
+
+test("preview page logs worker lifecycle and request timing", async () => {
+  const html = await readFile("index.html", "utf8");
+
+  assert.match(html, /const WORKER_LOG_PREFIX = "\[doclayout-worker\]"/);
+  assert.match(html, /event\.data\?\.type === "worker-log"/);
+  assert.match(html, /console\.info\(WORKER_LOG_PREFIX, event\.data\.message/);
+  assert.match(html, /const startedAt = performance\.now\(\)/);
+  assert.match(html, /pendingRequests\.set\(id, \{ resolve, reject, method, startedAt \}\)/);
+  assert.match(html, /durationMs = Math\.round\(performance\.now\(\) - pending\.startedAt\)/);
+  assert.match(html, /console\.info\(WORKER_LOG_PREFIX, "main request completed"/);
+  assert.match(html, /console\.error\(WORKER_LOG_PREFIX, "worker error"/);
+});
+
 test("preview legend avoids horizontal scroll and can be dragged", async () => {
   const html = await readFile("index.html", "utf8");
 

@@ -279,8 +279,6 @@
     </main>
 
     <script type="module">
-      import init, { PPDocLayoutWasm } from "./pkg/doclayout_detector.js";
-
       const fileInput = document.querySelector("#file");
       const dpiInput = document.querySelector("#dpi");
       const pageInput = document.querySelector("#page");
@@ -295,11 +293,76 @@
       const legend = document.querySelector("#legend");
       const pages = document.querySelector("#pages");
 
-      let detector = null;
-      let pdfBytes = null;
+      const MAX_CACHED_PAGES = 8;
+      const INTER_BATCH_PAUSE_MS = 60;
+      const WORKER_LOG_PREFIX = "[doclayout-worker]";
+      const worker = new Worker("wasm/doclayout-worker.js", { type: "module" });
+      const pendingRequests = new Map();
+      let nextRequestId = 1;
+      let pdfLoaded = false;
+      let pdfLoading = false;
       let pageCount = 0;
       const pageCache = new Map();
+      const pageCacheOrder = [];
+      let activeObjectUrls = [];
       let legendDrag = null;
+
+      worker.addEventListener("message", (event) => {
+        if (event.data?.type === "worker-log") {
+          console.info(WORKER_LOG_PREFIX, event.data.message, event.data.data || {});
+          return;
+        }
+
+        const { id, ok, result, error } = event.data;
+        const pending = pendingRequests.get(id);
+        if (!pending) return;
+        pendingRequests.delete(id);
+        const durationMs = Math.round(performance.now() - pending.startedAt);
+        if (ok) {
+          console.info(WORKER_LOG_PREFIX, "main request completed", {
+            id,
+            method: pending.method,
+            durationMs,
+          });
+          pending.resolve(result);
+        } else {
+          console.error(WORKER_LOG_PREFIX, "main request failed", {
+            id,
+            method: pending.method,
+            durationMs,
+            error,
+          });
+          pending.reject(new Error(error || "worker request failed"));
+        }
+      });
+
+      worker.addEventListener("error", (event) => {
+        console.error(WORKER_LOG_PREFIX, "worker error", {
+          message: event.message || "worker error",
+        });
+        for (const pending of pendingRequests.values()) {
+          pending.reject(new Error(event.message || "worker error"));
+        }
+        pendingRequests.clear();
+      });
+
+      function requestWorker(method, params = {}, transfer = []) {
+        const id = nextRequestId;
+        nextRequestId += 1;
+        return new Promise((resolve, reject) => {
+          const startedAt = performance.now();
+          pendingRequests.set(id, { resolve, reject, method, startedAt });
+          worker.postMessage({ id, method, params }, transfer);
+        });
+      }
+
+      function nextFrame() {
+        return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
 
       // Update the compact status line without using console output.
       function setStatus(message) {
@@ -356,7 +419,7 @@
 
       // Keep controls disabled while detection is running or inputs are absent.
       function setBusy(isBusy) {
-        const ready = Boolean(detector && pdfBytes && pageCount > 0);
+        const ready = Boolean(pdfLoaded && pageCount > 0);
         fileInput.disabled = isBusy;
         dpiInput.disabled = isBusy;
         pageInput.disabled = isBusy || !ready;
@@ -386,6 +449,30 @@
         return `${pageNumber}:${dpi}`;
       }
 
+      function rememberPage(key, page) {
+        if (!pageCache.has(key)) {
+          pageCacheOrder.push(key);
+        }
+        pageCache.set(key, page);
+        while (pageCacheOrder.length > MAX_CACHED_PAGES) {
+          const evicted = pageCacheOrder.shift();
+          pageCache.delete(evicted);
+        }
+      }
+
+      function clearPageCache() {
+        pageCache.clear();
+        pageCacheOrder.length = 0;
+      }
+
+      function clearRenderedPages() {
+        for (const url of activeObjectUrls) {
+          URL.revokeObjectURL(url);
+        }
+        activeObjectUrls = [];
+        pages.replaceChildren();
+      }
+
       // Reset aggregate progress when a new file or single-page run starts.
       function resetProgress(totalPages = pageCount) {
         progress.max = Math.max(totalPages, 1);
@@ -406,7 +493,7 @@
       function showCachedPage(pageNumber, dpi) {
         const cached = pageCache.get(pageCacheKey(pageNumber, dpi));
         if (!cached) return false;
-        pages.replaceChildren();
+        clearRenderedPages();
         appendPage(cached);
         setStatus(`Showing cached page ${pageNumber} of ${pageCount}.`);
         progress.max = Math.max(pageCount, 1);
@@ -423,12 +510,8 @@
         }
 
         setStatus("Loading wasm module...");
-        await init();
-        detector = new PPDocLayoutWasm();
-        if (pdfBytes) {
-          setPageCount(detector.loadPdf(pdfBytes));
-          setStatus(`${pageCount} pages loaded.`);
-        } else {
+        await requestWorker("boot");
+        if (!pdfLoaded && !pdfLoading) {
           setBusy(false);
           setStatus("Choose a PDF to detect layout boxes.");
         }
@@ -436,10 +519,10 @@
 
       fileInput.addEventListener("change", async () => {
         const file = fileInput.files?.[0];
-        pages.replaceChildren();
-        pageCache.clear();
+        clearRenderedPages();
+        clearPageCache();
         if (!file) {
-          pdfBytes = null;
+          pdfLoaded = false;
           pageCount = 0;
           resetProgress(0);
           setBusy(false);
@@ -447,10 +530,24 @@
           return;
         }
 
-        pdfBytes = new Uint8Array(await file.arrayBuffer());
-        const count = detector ? detector.loadPdf(pdfBytes) : 0;
-        setPageCount(count);
-        setStatus(detector ? `${file.name} loaded · ${count} pages.` : `${file.name} loaded.`);
+        setBusy(true);
+        pdfLoading = true;
+        setStatus(`Loading ${file.name}...`);
+        try {
+          const buffer = await file.arrayBuffer();
+          const count = await requestWorker("loadPdf", { bytes: buffer }, [buffer]);
+          pdfLoaded = true;
+          setPageCount(count);
+          setStatus(`${file.name} loaded · ${count} pages.`);
+        } catch (error) {
+          pdfLoaded = false;
+          pageCount = 0;
+          resetProgress(0);
+          setStatus(error instanceof Error ? error.message : String(error));
+          setBusy(false);
+        } finally {
+          pdfLoading = false;
+        }
       });
 
       pageInput.addEventListener("change", () => {
@@ -475,7 +572,7 @@
 
       // Detect only the selected page so large documents stay interactive by default.
       async function detectCurrentPage() {
-        if (!detector || !pdfBytes) return;
+        if (!pdfLoaded) return;
 
         const dpi = Number(dpiInput.value || 96);
         const pageNumber = currentPageNumber();
@@ -484,12 +581,14 @@
         resetProgress(pageCount);
 
         try {
-          pages.replaceChildren();
+          clearRenderedPages();
           setStatus(`Detecting page ${pageNumber} of ${pageCount}...`);
           const pageStartedAt = performance.now();
-          const page = await detector.detectLoadedPage(pageNumber, dpi);
-          pageCache.set(pageCacheKey(pageNumber, dpi), page);
+          await nextFrame();
+          const page = await requestWorker("detectLoadedPage", { pageNumber, dpi });
+          rememberPage(pageCacheKey(pageNumber, dpi), page);
           appendPage(page);
+          await nextFrame();
           const pageMs = Math.round(performance.now() - pageStartedAt);
           progress.value = 1;
           setSummary(1, pageCount, pageMs);
@@ -503,10 +602,10 @@
 
       // Detect every page only when explicitly requested.
       async function detectAllPages() {
-        if (!detector || !pdfBytes) return;
+        if (!pdfLoaded) return;
 
         setBusy(true);
-        pages.replaceChildren();
+        clearRenderedPages();
         resetProgress(pageCount);
 
         try {
@@ -520,13 +619,20 @@
             const endPage = startPage + count - 1;
             pageInput.value = String(startPage);
             setStatus(`Detecting pages ${startPage}-${endPage} of ${pageCount}...`);
-            const batch = await detector.detectLoadedPages(startPage, count, dpi);
+            await nextFrame();
+            const batch = await requestWorker("detectLoadedPages", { startPage, count, dpi });
             for (const page of batch) {
-              pageCache.set(pageCacheKey(page.pageNumber, dpi), page);
+              rememberPage(pageCacheKey(page.pageNumber, dpi), page);
+              clearRenderedPages();
+              pageInput.value = String(page.pageNumber);
               appendPage(page);
+              await nextFrame();
               processedPages += 1;
               progress.value = processedPages;
               setSummary(processedPages, pageCount, performance.now() - startedAt);
+            }
+            if (endPage < pageCount) {
+              await sleep(INTER_BATCH_PAUSE_MS);
             }
           }
           const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
@@ -549,7 +655,9 @@
 
         const img = document.createElement("img");
         const blob = new Blob([page.imageBytes], { type: "image/png" });
-        img.src = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(blob);
+        activeObjectUrls.push(url);
+        img.src = url;
         img.alt = `Page ${page.pageNumber} with layout boxes`;
 
         section.append(title, img);

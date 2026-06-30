@@ -54,3 +54,34 @@ test("wasm exposes loaded page batch detection", async () => {
   assert.match(detector, /detect_pages_async/);
   assert.match(detector, /infer_batch_async/);
 });
+
+test("preview worker owns wasm detector calls off the main thread", async () => {
+  const worker = await readFile("wasm/doclayout-worker.js", "utf8");
+
+  assert.match(worker, /import init, \{ PPDocLayoutWasm \} from "\.\.\/pkg\/doclayout_detector\.js"/);
+  assert.match(worker, /new PPDocLayoutWasm\(\)/);
+  assert.match(worker, /detectLoadedPage/);
+  assert.match(worker, /detectLoadedPages/);
+  assert.match(worker, /self\.postMessage/);
+});
+
+test("preview worker transfers image byte buffers without cloning", async () => {
+  const worker = await readFile("wasm/doclayout-worker.js", "utf8");
+
+  assert.match(worker, /function transferablesForResult/);
+  assert.match(worker, /imageBytes\.buffer/);
+  assert.match(worker, /const transferables = transferablesForResult\(result\)/);
+  assert.match(worker, /self\.postMessage\(\{ id, ok: true, result \}, transferables\)/);
+});
+
+test("preview worker emits lifecycle and request timing logs", async () => {
+  const worker = await readFile("wasm/doclayout-worker.js", "utf8");
+
+  assert.match(worker, /function postWorkerLog/);
+  assert.match(worker, /type: "worker-log"/);
+  assert.match(worker, /worker boot started/);
+  assert.match(worker, /worker boot completed/);
+  assert.match(worker, /worker request started/);
+  assert.match(worker, /worker request completed/);
+  assert.match(worker, /durationMs/);
+});

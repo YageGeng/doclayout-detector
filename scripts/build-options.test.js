@@ -7,4 +7,5 @@ test("wasm release build uses Rust opt-level 3", async () => {
 
   assert.match(buildScript, /CARGO_PROFILE_RELEASE_OPT_LEVEL/);
   assert.match(buildScript, /CARGO_PROFILE_RELEASE_OPT_LEVEL:\s*"3"/);
+  assert.match(buildScript, /"backend-webgpu,wasm"/);
 });

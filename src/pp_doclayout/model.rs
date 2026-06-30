@@ -9,7 +9,7 @@ use burn::tensor::ops::{GridSampleOptions, InterpolateMode};
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_nn::{LayerNorm, Linear};
 use std::path::Path;
-#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu", feature = "wasm"))]
 use tracing::Level;
 
 #[derive(Debug, Clone)]
@@ -345,13 +345,25 @@ fn pad_queries<B: Backend>(tensor: Tensor<B, 3>, channels: usize) -> Tensor<B, 3
         .slice([0..1, 0..300, 0..channels])
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "backend-metal"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(
+        feature = "backend-metal",
+        all(feature = "backend-webgpu", target_os = "macos")
+    )
+))]
 /// Selects proposal indices with sort-backed top-k to avoid Metal reduce shader failures.
 fn proposal_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
     scores.topk_with_indices(topk, 1).1
 }
 
-#[cfg(not(all(not(target_family = "wasm"), feature = "backend-metal")))]
+#[cfg(not(all(
+    not(target_family = "wasm"),
+    any(
+        feature = "backend-metal",
+        all(feature = "backend-webgpu", target_os = "macos")
+    )
+)))]
 /// Selects proposal indices with the active backend's top-k kernel.
 fn proposal_topk_indices<B: Backend>(scores: Tensor<B, 3>, topk: usize) -> Tensor<B, 3, Int> {
     scores.argtopk(topk, 1)
@@ -1008,14 +1020,14 @@ fn mask_to_box_coordinate<B: Backend>(masks: Tensor<B, 4>) -> Tensor<B, 3> {
         .mask_fill(non_empty.bool_not().repeat_dim(2, 4), 0.0)
 }
 
-#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu", feature = "wasm"))]
 #[derive(Debug, Clone)]
 struct WasmForwardTimer {
     step: &'static str,
     started_ms: f64,
 }
 
-#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu", feature = "wasm"))]
 impl WasmForwardTimer {
     /// Start a browser-compatible timer for a model forward step.
     fn start(step: &'static str) -> Self {
@@ -1034,6 +1046,29 @@ impl WasmForwardTimer {
             "pp_doclayout forward step completed"
         );
     }
+}
+
+#[cfg(all(
+    target_family = "wasm",
+    feature = "backend-webgpu",
+    not(feature = "wasm")
+))]
+#[derive(Debug, Clone)]
+struct WasmForwardTimer;
+
+#[cfg(all(
+    target_family = "wasm",
+    feature = "backend-webgpu",
+    not(feature = "wasm")
+))]
+impl WasmForwardTimer {
+    /// Start a no-op timer when browser bindings are not enabled.
+    fn start(_step: &'static str) -> Self {
+        Self
+    }
+
+    /// No-op finish for pure WebGPU backend builds without wasm exports.
+    fn finish(self) {}
 }
 
 /// Emits optional tensor statistics when `LITEPARSE_LAYOUT_DEBUG_STATS` is enabled.
@@ -1088,7 +1123,7 @@ mod tests {
         #[cfg(feature = "backend-vulkan")]
         burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(device, Default::default());
         #[cfg(feature = "backend-webgpu")]
-        burn_wgpu::init_setup::<burn_wgpu::graphics::WebGpu>(device, Default::default());
+        burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(device, Default::default());
     }
 
     #[test]

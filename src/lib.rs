@@ -4,9 +4,9 @@ pub mod model;
 pub mod pp_doclayout;
 pub mod preprocess;
 pub mod types;
-#[cfg(all(target_arch = "wasm32", feature = "backend-webgpu"))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod wasi_stubs;
-#[cfg(all(target_arch = "wasm32", feature = "backend-webgpu"))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod wasm;
 
 pub use annotate::{AnnotatedDetection, annotate_page_rgba};

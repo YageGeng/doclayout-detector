@@ -408,13 +408,13 @@ impl StepTimer {
     }
 }
 
-#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu", feature = "wasm"))]
 #[derive(Debug, Clone)]
 struct StepTimer {
     started_ms: f64,
 }
 
-#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu", feature = "wasm"))]
 impl StepTimer {
     /// Start a browser-compatible timer for WebGPU model step logging.
     fn start() -> Self {
@@ -426,5 +426,30 @@ impl StepTimer {
     /// Return elapsed milliseconds without using unsupported wasm system time.
     fn elapsed_ms(&self) -> f64 {
         js_sys::Date::now() - self.started_ms
+    }
+}
+
+#[cfg(all(
+    target_family = "wasm",
+    feature = "backend-webgpu",
+    not(feature = "wasm")
+))]
+#[derive(Debug, Clone)]
+struct StepTimer;
+
+#[cfg(all(
+    target_family = "wasm",
+    feature = "backend-webgpu",
+    not(feature = "wasm")
+))]
+impl StepTimer {
+    /// Start a no-op timer when browser bindings are not enabled.
+    fn start() -> Self {
+        Self
+    }
+
+    /// Return zero elapsed time without pulling browser JS dependencies.
+    fn elapsed_ms(&self) -> f64 {
+        0.0
     }
 }

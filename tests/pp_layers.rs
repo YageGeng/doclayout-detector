@@ -22,7 +22,7 @@ fn init_wgpu_test_backend(device: &burn_wgpu::WgpuDevice) {
     #[cfg(feature = "backend-vulkan")]
     burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(device, Default::default());
     #[cfg(feature = "backend-webgpu")]
-    burn_wgpu::init_setup::<burn_wgpu::graphics::WebGpu>(device, Default::default());
+    burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(device, Default::default());
 }
 
 #[test]

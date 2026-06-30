@@ -12,11 +12,40 @@ fn package_name_matches_doclayout_detector_project() {
 fn features_match_backend_cli_and_webgpu_shape() {
     let features = parse_cargo_features(include_str!("../Cargo.toml"));
 
-    assert_feature_items(&features, "default", &["backend-vulkan", "cli"]);
+    assert_feature_items(&features, "default", &["backend-webgpu", "cli"]);
     assert_feature_items(&features, "cli", &["dep:clap", "dep:png"]);
+    assert_feature_items(
+        &features,
+        "backend-webgpu",
+        &["burn-wgpu/webgpu", "burn-wgpu/metal", "dep:burn-wgpu"],
+    );
     assert!(!features.contains_key("native-cli"));
     assert!(!features.contains_key("backend-ndarray"));
-    assert_feature_contains(&features, "backend-webgpu", "panic_hook");
+    assert_feature_contains(&features, "wasm", "backend-webgpu");
+    assert_feature_contains(&features, "wasm", "dep:wasm-bindgen");
+    assert_feature_contains(&features, "wasm", "dep:tracing-wasm");
+    assert!(!features["backend-webgpu"].contains(&"panic_hook".to_string()));
+    assert!(!features["backend-webgpu"].contains(&"dep:wasm-bindgen".to_string()));
+}
+
+#[test]
+fn native_webgpu_backend_uses_auto_graphics_api() {
+    let model = include_str!("../src/model.rs");
+
+    assert!(model.contains("const BACKEND_NAME: &str = \"auto\""));
+    assert!(model.contains("const BACKEND_NAME: &str = \"webgpu\""));
+    assert!(model.contains("init_setup::<burn_wgpu::graphics::AutoGraphicsApi>"));
+    assert!(model.contains("init_setup_async::<burn_wgpu::graphics::WebGpu>"));
+}
+
+#[test]
+fn native_webgpu_backend_uses_metal_safe_topk_path() {
+    let model = include_str!("../src/pp_doclayout/model.rs");
+
+    assert!(model.contains("feature = \"backend-metal\""));
+    assert!(model.contains("feature = \"backend-webgpu\""));
+    assert!(model.contains("target_os = \"macos\""));
+    assert!(model.contains("scores.topk_with_indices(topk, 1).1"));
 }
 
 fn assert_feature_items(

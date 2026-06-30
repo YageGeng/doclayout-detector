@@ -73,13 +73,14 @@ getrandom = {
 }
 
 [features]
-default = ["backend-vulkan", "cli"]
+default = ["backend-webgpu", "cli"]
 cli = ["dep:clap", "dep:png"]
 backend-metal = ["burn-wgpu/metal", "dep:burn-wgpu"]
 backend-vulkan = ["burn-wgpu/vulkan", "dep:burn-wgpu"]
-backend-webgpu = [
-  "burn-wgpu/webgpu",
-  "dep:burn-wgpu",
+# Browser WebGPU plus Metal compiler support for native AutoGraphicsApi on macOS.
+backend-webgpu = ["burn-wgpu/webgpu", "burn-wgpu/metal", "dep:burn-wgpu"]
+wasm = [
+  "backend-webgpu",
   "dep:js-sys",
   "dep:png",
   "dep:serde_bytes",

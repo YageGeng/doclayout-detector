@@ -18,7 +18,7 @@ const wasmPackArgs = [
   "--",
   "--no-default-features",
   "--features",
-  "backend-webgpu",
+  "backend-webgpu,wasm",
 ];
 
 const wasmTargetRustflags = [

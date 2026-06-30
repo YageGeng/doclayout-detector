@@ -4,7 +4,7 @@ use crate::pp_doclayout::{
     PPDocLayoutV3OwnedOutputs, PPDocLayoutV3Weights,
 };
 use burn::tensor::{Tensor, TensorData};
-#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu", feature = "wasm"))]
 use tracing::Level;
 
 #[cfg(not(any(
@@ -53,7 +53,9 @@ pub type LayoutDevice = burn_wgpu::WgpuDevice;
 const BACKEND_NAME: &str = "metal";
 #[cfg(all(feature = "backend-vulkan", not(feature = "backend-webgpu")))]
 const BACKEND_NAME: &str = "vulkan";
-#[cfg(feature = "backend-webgpu")]
+#[cfg(all(not(target_family = "wasm"), feature = "backend-webgpu"))]
+const BACKEND_NAME: &str = "auto";
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
 const BACKEND_NAME: &str = "webgpu";
 
 #[derive(Debug, Clone)]
@@ -274,14 +276,14 @@ impl EmbeddedModel {
     }
 }
 
-#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu", feature = "wasm"))]
 #[derive(Debug, Clone)]
 struct EmbeddedWasmTimer {
     step: &'static str,
     started_ms: f64,
 }
 
-#[cfg(all(target_family = "wasm", feature = "backend-webgpu"))]
+#[cfg(all(target_family = "wasm", feature = "backend-webgpu", feature = "wasm"))]
 impl EmbeddedWasmTimer {
     /// Start a browser-compatible timer for embedded model IO steps.
     fn start(step: &'static str) -> Self {
@@ -300,6 +302,29 @@ impl EmbeddedWasmTimer {
             "embedded model step completed"
         );
     }
+}
+
+#[cfg(all(
+    target_family = "wasm",
+    feature = "backend-webgpu",
+    not(feature = "wasm")
+))]
+#[derive(Debug, Clone)]
+struct EmbeddedWasmTimer;
+
+#[cfg(all(
+    target_family = "wasm",
+    feature = "backend-webgpu",
+    not(feature = "wasm")
+))]
+impl EmbeddedWasmTimer {
+    /// Start a no-op timer when browser bindings are not enabled.
+    fn start(_step: &'static str) -> Self {
+        Self
+    }
+
+    /// No-op finish for pure WebGPU backend builds without wasm exports.
+    fn finish(self) {}
 }
 
 /// Loads the embedded PP-DocLayoutV3 safetensors weights into the selected backend.
@@ -330,10 +355,10 @@ fn create_device() -> LayoutDevice {
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "backend-webgpu"))]
-/// Creates and initializes a native WebGPU-backed WGPU device.
+/// Creates and initializes a native auto-selected WGPU device for the WebGPU backend feature.
 fn create_device() -> LayoutDevice {
     let device = burn_wgpu::WgpuDevice::DefaultDevice;
-    burn_wgpu::init_setup::<burn_wgpu::graphics::WebGpu>(&device, Default::default());
+    burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(&device, Default::default());
     device
 }
 
